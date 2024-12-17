@@ -930,6 +930,9 @@ async function handleGetTrades(bot, msg, contractInstance) {
         ✨ Position State 
         ────────────────────
         ${trade.buy?(openPrice<currentPrices?"Profit 🤑":"Loss 😞"):(openPrice>currentPrices?"Profit 🤑":"Loss 😞")}
+        
+        (Profit/Loss API 
+        Integration Soon)
 
         💰 Position Details
         ────────────────────
@@ -938,12 +941,12 @@ async function handleGetTrades(bot, msg, contractInstance) {
 
         🎯 Trade Markers
         ────────────────────
-        🔹 Open Price: ${parseFloat(openPrice).toFixed(4)}
-        💹 Current Price: ${parseFloat(currentPrices).toFixed(4) || "NaN"}
+        🔹 Open Price: ${parseFloat(openPrice).toFixed(4)}$
+        💹 Current Price: ${parseFloat(currentPrices).toFixed(4) || "NaN"}$
          
-        🚦 Take Profit: ${ethers.formatUnits(trade.tp, 10)}
-        ⚠️ Stop Loss: ${ethers.formatUnits(trade.sl, 10)}
-        💥 Liquidation: ${ethers.formatUnits(trade.liquidationPrice, 10)}
+        🚦 Take Profit: ${parseFloat(ethers.formatUnits(trade.tp, 10)).toFixed(4)}$
+        ⚠️ Stop Loss: ${parseFloat(ethers.formatUnits(trade.sl, 10)).toFixed(4)}$
+        💥 Liquidation: ${parseFloat(ethers.formatUnits(trade.liquidationPrice, 10)).toFixed(4)}$
 
 
         ${trade.buy ? "🚀 Riding the Bullish Wave" : "🐻 Navigating Bearish Currents"}
