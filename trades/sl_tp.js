@@ -16,16 +16,16 @@ function calculateStopLoss(currentPrice, userStopLoss, leverage, isLong) {
             throw new Error('Invalid input parameters');
         }
 
-       
+       console.log(currentPrice,isLong,userStopLoss,leverage)
         if (isLong) {
             const maxStopLossMove = parseFloat(currentPrice) - ((MAX_STOPLOSS_PERCENTAGE*currentPrice)/leverage)
-            
+            console.log(maxStopLossMove)
             return userStopLoss>maxStopLossMove ? parseFloat(userStopLoss) : maxStopLossMove
                              
         } else {
 
             const maxStopLossMove = parseFloat(currentPrice) + parseFloat((MAX_STOPLOSS_PERCENTAGE*currentPrice)/leverage);
-           
+           console.log(maxStopLossMove)
             return maxStopLossMove> userStopLoss ? parseFloat(userStopLoss) : maxStopLossMove
 
         }

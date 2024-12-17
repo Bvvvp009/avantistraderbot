@@ -1,24 +1,57 @@
-// signClientService.js
 const { SignClient } = require('@walletconnect/sign-client');
 const express = require('express');
 const cors = require('cors');
-const dotenv = require('dotenv');
-
-dotenv.config();
+require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
 
 const app = express();
 
+// Enhanced logging function
+function log(level, message, error = null) {
+    const timestamp = new Date().toISOString();
+    console[level](`[${timestamp}] ${message}`, error ? error : '');
+}
+
+// Robust retry mechanism with exponential backoff
+async function retryOperation(operation, maxRetries = 5, baseDelay = 1000) {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            return await operation();
+        } catch (error) {
+            const delay = baseDelay * Math.pow(2, attempt);
+            log('warn', `Operation failed (Attempt ${attempt + 1}/${maxRetries}). Retrying in ${delay}ms`, error);
+            
+            // Add jitter to prevent thundering herd problem
+            const jitteredDelay = delay * (0.7 + Math.random() * 0.6);
+            await new Promise(resolve => setTimeout(resolve, jitteredDelay));
+        }
+    }
+    throw new Error('Max retries exceeded');
+}
+
 // Middleware setup
 app.use(cors());
-app.use(express.json({ strict: false })); // Allow relaxed JSON parsing
+app.use(express.json({ strict: false }));
 app.use(express.urlencoded({ extended: true }));
 
 let signClientInstance = null;
 const activeSessions = new Map();
 const topicMapping = new Map();
 
-async function initSignClient(retries = 3) {
-    for (let i = 0; i < retries; i++) {
+// Global error handler to prevent process exit
+process.on('uncaughtException', (error) => {
+    log('error', 'Uncaught Exception:', error);
+    // Attempt to reinitialize critical services
+    initSignClient().catch(initError => {
+        log('error', 'Failed to recover from uncaught exception:', initError);
+    });
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    log('error', 'Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+async function initSignClient(retries = 5) {
+    return retryOperation(async () => {
         try {
             signClientInstance = await SignClient.init({
                 projectId: process.env.PROJECT_ID,
@@ -31,199 +64,197 @@ async function initSignClient(retries = 3) {
             });
 
             setupEventListeners();
-            console.log('SignClient initialized successfully');
+            log('info', 'SignClient initialized successfully');
             return true;
         } catch (error) {
-            console.error(`SignClient initialization attempt ${i + 1} failed:`, error);
-            if (i === retries - 1) throw error;
-            await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
+            log('error', 'SignClient initialization failed', error);
+            throw error;
         }
-    }
+    }, retries);
 }
 
 function setupEventListeners() {
-    signClientInstance.on("session_event", ({ event, session }) => {
-        console.log("session_event", event);
-        const sessionData = activeSessions.get(session.topic);
-        if (sessionData) {
-            sessionData.events.push(event);
-        }
-    });
+    // Wrap event listeners with error handling
+    ['session_event', 'session_update', 'session_delete', 'session_expire'].forEach(eventName => {
+        signClientInstance.on(eventName, (data) => {
+            try {
+                switch(eventName) {
+                    case 'session_event':
+                        log('info', `Session Event: ${JSON.stringify(data.event)}`);
+                        break;
+                    case 'session_update':
+                        log('info', `Session Update: ${data.topic}`);
+                        break;
+                    case 'session_delete':
+                    case 'session_expire':
+                        log('warn', `Session Terminated: ${data.topic}`);
+                        break;
+                }
 
-    signClientInstance.on("session_update", ({ topic, params }) => {
-        console.log("session_update", topic, params);
-        const sessionData = activeSessions.get(topic);
-        if (sessionData) {
-            sessionData.params = { ...sessionData.params, ...params };
-        }
+                // Cleanup logic remains the same as in previous implementation
+                if (eventName === 'session_delete' || eventName === 'session_expire') {
+                    activeSessions.delete(data.topic);
+                    for (const [tempTopic, finalTopic] of topicMapping.entries()) {
+                        if (finalTopic === data.topic) {
+                            topicMapping.delete(tempTopic);
+                            activeSessions.delete(tempTopic);
+                        }
+                    }
+                }
+            } catch (error) {
+                log('error', `Error in ${eventName} handler`, error);
+            }
+        });
     });
-
-    signClientInstance.on("session_delete", ({ topic }) => {
-        console.log("session_delete", topic);
-        
-        // Clean up both the session and any mappings
-        activeSessions.delete(topic);
-        for (const [tempTopic, finalTopic] of topicMapping.entries()) {
-          if (finalTopic === topic) {
-            topicMapping.delete(tempTopic);
-            activeSessions.delete(tempTopic);
-          }
-        }
-      });
-      
-      // Handle unexpected disconnections
-      signClientInstance.on("session_expire", ({ topic }) => {
-        console.log("session_expire", topic);
-        
-        // Clean up both the session and any mappings
-        activeSessions.delete(topic);
-        for (const [tempTopic, finalTopic] of topicMapping.entries()) {
-          if (finalTopic === topic) {
-            topicMapping.delete(tempTopic);
-            activeSessions.delete(tempTopic);
-          }
-        }
-      });
 }
 
-// Middleware to check SignClient status
+// Middleware to check SignClient status with recovery
 const checkSignClient = async (req, res, next) => {
-    if (!signClientInstance) {
-        try {
+    try {
+        if (!signClientInstance) {
             await initSignClient();
-        } catch (error) {
-            console.error('SignClient check failed:', error);
-            return res.status(503).json({ error: 'SignClient service unavailable' });
         }
+        next();
+    } catch (error) {
+        log('error', 'SignClient check failed', error);
+        res.status(503).json({ 
+            error: 'SignClient service temporarily unavailable', 
+            retryAfter: 30 
+        });
     }
-    next();
 };
 
-// Request logging middleware
+// Request logging middleware with error protection
 app.use((req, res, next) => {
-    console.log(`${new Date().toISOString()} ${req.method} ${req.url}`);
+    const startTime = Date.now();
+    
+    // Override res.json to log response
+    const originalJson = res.json;
+    res.json = function(body) {
+        const responseTime = Date.now() - startTime;
+        log('info', `${req.method} ${req.url} - ${res.statusCode} (${responseTime}ms)`);
+        return originalJson.call(this, body);
+    };
+
     next();
 });
 
-// API endpoints
-// Add a mapping to track temporary to final topics
-
-
+// Connection endpoint
 app.post('/connect', checkSignClient, async (req, res) => {
-  try {
-    const { uri, approval } = await signClientInstance.connect({
-      requiredNamespaces: {
-        eip155: {
-          methods: [
-            'eth_sendTransaction',
-            'eth_sign',
-            'personal_sign',
-            'eth_signTypedData',
-            'eth_signTypedData_v4'
-          ],
-          chains: ['eip155:8453'],
-          events: ['chainChanged', 'accountsChanged', 'connect', 'disconnect'],
-          rpcMap: {
-            8453: 'https://mainnet.base.org'
-          }
-        }
-      }
-    });
-
-    // Generate a temporary topic ID
-    const tempTopic = `pending_${Date.now()}`;
-    
-    // Store pending session data
-    activeSessions.set(tempTopic, {
-      uri,
-      approval,
-      events: [],
-      params: {},
-      status: 'pending'
-    });
-
-    // Send immediate response with URI and temporary topic
-    res.json({ uri, topic: tempTopic });
-
     try {
-      // Handle approval asynchronously
-      const session = await approval();
-      
-      // Store the mapping between temporary and final topics
-      topicMapping.set(tempTopic, session.topic);
-      
-      // Add the new session without immediately deleting the temp session
-      activeSessions.set(session.topic, {
-        uri,
-        approval,
-        events: [],
-        params: {},
-        status: 'connected',
-        session
-      });
+        const { uri, approval } = await signClientInstance.connect({
+            requiredNamespaces: {
+                eip155: {
+                    methods: [
+                        'eth_sendTransaction',
+                        'eth_sign',
+                        'personal_sign',
+                        'eth_signTypedData',
+                        'eth_signTypedData_v4'
+                    ],
+                    chains: ['eip155:8453'],
+                    events: ['chainChanged', 'accountsChanged', 'connect', 'disconnect'],
+                    rpcMap: {
+                        8453: 'https://mainnet.base.org'
+                    }
+                }
+            }
+        });
 
-      // Set a timeout to clean up the temporary session
-      setTimeout(() => {
-        activeSessions.delete(tempTopic);
-        topicMapping.delete(tempTopic);
-      }, 60000); // Keep temp session for 1 minute to allow status checks
+        // Generate a temporary topic ID
+        const tempTopic = `pending_${Date.now()}`;
+        
+        // Store pending session data
+        activeSessions.set(tempTopic, {
+            uri,
+            approval,
+            events: [],
+            params: {},
+            status: 'pending'
+        });
 
-    } catch (approvalError) {
-      console.error('Approval error:', approvalError);
-      activeSessions.set(tempTopic, {
-        ...activeSessions.get(tempTopic),
-        status: 'failed',
-        error: approvalError.message
-      });
+        // Send immediate response with URI and temporary topic
+        res.json({ uri, topic: tempTopic });
+
+        try {
+            // Handle approval asynchronously
+            const session = await approval();
+            
+            // Store the mapping between temporary and final topics
+            topicMapping.set(tempTopic, session.topic);
+            
+            // Add the new session without immediately deleting the temp session
+            activeSessions.set(session.topic, {
+                uri,
+                approval,
+                events: [],
+                params: {},
+                status: 'connected',
+                session
+            });
+
+            // Set a timeout to clean up the temporary session
+            setTimeout(() => {
+                activeSessions.delete(tempTopic);
+                topicMapping.delete(tempTopic);
+            }, 60000); // Keep temp session for 1 minute to allow status checks
+
+        } catch (approvalError) {
+            log('error', 'Approval error', approvalError);
+            activeSessions.set(tempTopic, {
+                ...activeSessions.get(tempTopic),
+                status: 'failed',
+                error: approvalError.message
+            });
+        }
+
+    } catch (error) {
+        log('error', 'Connection error', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Session status endpoint
+app.get('/session-status/:topic', (req, res) => {
+    const requestedTopic = req.params.topic;
+    const finalTopic = topicMapping.get(requestedTopic);
+    
+    // Check both temporary and final topics
+    const tempSessionData = activeSessions.get(requestedTopic);
+    const finalSessionData = finalTopic ? activeSessions.get(finalTopic) : null;
+    
+    if (!tempSessionData && !finalSessionData) {
+        res.status(404).json({ error: 'Session not found' });
+        return;
     }
 
-  } catch (error) {
-    console.error('Connection error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
+    // If we have a final session, return that status
+    if (finalSessionData) {
+        res.json({
+            status: 'connected',
+            topic: finalTopic,
+            temporary: false
+        });
+        return;
+    }
 
-// Modified session status endpoint
-app.get('/session-status/:topic', (req, res) => {
-  const requestedTopic = req.params.topic;
-  const finalTopic = topicMapping.get(requestedTopic);
-  
-  // Check both temporary and final topics
-  const tempSessionData = activeSessions.get(requestedTopic);
-  const finalSessionData = finalTopic ? activeSessions.get(finalTopic) : null;
-  
-  if (!tempSessionData && !finalSessionData) {
-    res.status(404).json({ error: 'Session not found' });
-    return;
-  }
-
-  // If we have a final session, return that status
-  if (finalSessionData) {
+    // Otherwise return the temporary session status
     res.json({
-      status: 'connected',
-      topic: finalTopic,
-      temporary: false
+        status: tempSessionData.status,
+        topic: requestedTopic,
+        temporary: true,
+        error: tempSessionData.error
     });
-    return;
-  }
-
-  // Otherwise return the temporary session status
-  res.json({
-    status: tempSessionData.status,
-    topic: requestedTopic,
-    temporary: true,
-    error: tempSessionData.error
-  });
 });
 
-
+// Request endpoint
 app.post('/request/:topic', checkSignClient, async (req, res) => {
     try {
         const { topic } = req.params;
         const { chainId, request } = req.body;
 
-        console.log('Incoming request for topic:', topic);
-        console.log('Request payload:', { chainId, request });
+        log('info', `Incoming request for topic: ${topic}`);
+        log('info', `Request payload: ${JSON.stringify({ chainId, request })}`);
 
         if (!activeSessions.has(topic)) {
             return res.status(404).json({ error: 'Session not found' });
@@ -235,10 +266,10 @@ app.post('/request/:topic', checkSignClient, async (req, res) => {
             request
         });
 
-        console.log('Request successful:', result);
+        log('info', 'Request successful', result);
         res.json({ result });
     } catch (error) {
-        console.error('Request error:', error);
+        log('error', 'Request error', error);
         res.status(500).json({
             error: 'Request failed',
             message: error.message
@@ -246,25 +277,27 @@ app.post('/request/:topic', checkSignClient, async (req, res) => {
     }
 });
 
+// Fetch session endpoint
 app.get('/session/:topic', checkSignClient, async (req, res) => {
     try {
         const { topic } = req.params;
-        console.log('Fetching session for topic:', topic);
+        log('info', `Fetching session for topic: ${topic}`);
 
         const session = await signClientInstance.session.get(topic);
-        console.log('Session found:', session.topic);
+        log('info', 'Session found', session.topic);
 
         res.json({ session });
     } catch (error) {
-        console.error('Session fetch error:', error);
+        log('error', 'Session fetch error', error);
         res.status(404).json({ error: 'Session not found' });
     }
 });
 
+// Disconnect session endpoint
 app.delete('/session/:topic', checkSignClient, async (req, res) => {
     try {
         const { topic } = req.params;
-        console.log('Disconnecting session:', topic);
+        log('info', `Disconnecting session: ${topic}`);
 
         await signClientInstance.disconnect({
             topic,
@@ -274,7 +307,7 @@ app.delete('/session/:topic', checkSignClient, async (req, res) => {
         activeSessions.delete(topic);
         res.json({ success: true });
     } catch (error) {
-        console.error('Disconnect error:', error);
+        log('error', 'Disconnect error', error);
         res.status(500).json({
             error: 'Failed to disconnect',
             message: error.message
@@ -282,39 +315,107 @@ app.delete('/session/:topic', checkSignClient, async (req, res) => {
     }
 });
 
-// Error handling middleware
+// Enhanced error handling middleware
 app.use((err, req, res, next) => {
-    console.error('Unhandled error:', err);
+    log('error', 'Unhandled error in request processing', err);
+    
     res.status(500).json({
         error: 'Internal server error',
-        message: err.message
+        message: err.message,
+        timestamp: new Date().toISOString()
     });
 });
 
-// Start the service
-const PORT = process.env.PORT || 3000;
+// Monitoring and recovery mechanism
+function startMonitoring() {
+    // Session cleanup
+    const sessionCleanupInterval = setInterval(() => {
+        try {
+            const now = Date.now();
+            for (const [topic, session] of activeSessions.entries()) {
+                if (now - (session.timestamp || now) > 24 * 60 * 60 * 1000) {
+                    activeSessions.delete(topic);
+                    log('info', `Cleaned up inactive session: ${topic}`);
+                }
+            }
+        } catch (error) {
+            log('error', 'Error in session cleanup', error);
+        }
+    }, 60 * 60 * 1000);
 
+    // Periodic SignClient health check
+    const healthCheckInterval = setInterval(async () => {
+        try {
+            if (!signClientInstance) {
+                await initSignClient();
+            }
+            // Optional: Add more health checks here
+        } catch (error) {
+            log('error', 'Health check failed', error);
+        }
+    }, 30 * 60 * 1000); // Every 30 minutes
+
+    return { sessionCleanupInterval, healthCheckInterval };
+}
+
+// Graceful shutdown handler
+function gracefulShutdown(intervals) {
+    process.on('SIGTERM', async () => {
+        log('info', 'SIGTERM received. Shutting down gracefully...');
+        
+        // Clear intervals
+        Object.values(intervals).forEach(clearInterval);
+
+        // Disconnect all active sessions
+        for (const topic of activeSessions.keys()) {
+            try {
+                await signClientInstance.disconnect({
+                    topic,
+                    reason: { code: 6000, message: 'Server shutdown' }
+                });
+            } catch (error) {
+                log('error', `Error disconnecting session ${topic}`, error);
+            }
+        }
+
+        process.exit(0);
+    });
+}
+
+// Start the service
 async function startServer() {
+    const PORT = process.env.PORT || 3000;
+
     try {
+        // Initialize SignClient
         await initSignClient();
-        app.listen(PORT, () => {
-            console.log(`SignClient service running on port ${PORT}`);
+
+        // Start the server
+        const server = app.listen(PORT, () => {
+            log('info', `SignClient service running on port ${PORT}`);
         });
+
+        // Setup monitoring and recovery mechanisms
+        const intervals = startMonitoring();
+
+        // Setup graceful shutdown
+        gracefulShutdown(intervals);
+
+        // Handle server errors
+        server.on('error', (error) => {
+            log('error', 'Server error', error);
+            // Attempt to restart
+            startServer().catch(restartError => {
+                log('error', 'Failed to restart server', restartError);
+            });
+        });
+
     } catch (error) {
-        console.error('Failed to start server:', error);
-        process.exit(1);
+        log('error', 'Failed to start server', error);
+        // Retry server start
+        setTimeout(startServer, 5000);
     }
 }
 
-// Clean up inactive sessions periodically
-setInterval(() => {
-    const now = Date.now();
-    for (const [topic, session] of activeSessions.entries()) {
-        if (now - session.timestamp > 24 * 60 * 60 * 1000) { // 24 hours
-            activeSessions.delete(topic);
-            console.log('Cleaned up inactive session:', topic);
-        }
-    }
-}, 60 * 60 * 1000); // Check every hour
-
+// Initial server start
 startServer();

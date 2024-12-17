@@ -212,7 +212,7 @@ async function initBot() {
       // Request new connection
       const { uri, topic } = await makeWalletConnectRequest('/connect', 'POST');
   
-      if (uri) {
+      /*if (uri) {
         const qrCodeImage = await QRCode.toBuffer(uri);
         const statusMessage = await bot.sendMessage(msg.chat.id, 'Connecting wallet...');
   
@@ -232,13 +232,21 @@ async function initBot() {
         // Create clickable wallet connection links
         const walletLinksText = walletLinks.map(wallet => 
           `${wallet.icon} [Connect with ${wallet.name}](${wallet.link})`
+          
         ).join('\n');
-  
+        
+        function escapeMarkdown(text) {
+          return text.replace(/[_*[\]]/g, '\\$&');
+        }
+        
+        const escapedUri = escapeMarkdown(uri);
+        
         await bot.sendPhoto(msg.chat.id, qrCodeImage, {
           caption: 
             `Scan QR Code or Quick Connect:\n\n` +
             `${walletLinksText}\n\n` +
-            `Scan the QR code or tap a wallet link to connect.`,
+            `Scan the QR code or tap a wallet link to connect.\n` +
+            `OR Directly paste this URI in your wallet: \`${escapedUri}\``, // Highlight the URI
           parse_mode: "Markdown",
           reply_markup: {
             inline_keyboard: walletLinks.map(wallet => [
@@ -249,6 +257,100 @@ async function initBot() {
             ])
           }
         });
+
+        */
+
+
+        if (uri) {
+          // Generate QR Code
+          const qrCodeImage = await QRCode.toBuffer(uri);
+
+          const statusMessage = await bot.sendMessage(msg.chat.id, 'Connecting wallet...');
+        
+          // Base redirect URL
+          const baseRedirectUrl = 'https://bvvvp009.github.io/wallet-connect-reconnect/redirect.html';
+        
+          // Wallet-specific redirect links
+          const walletLinks = [
+            {
+              name: 'MetaMask',
+              redirectScheme: 'metamask',
+              icon: '🦊',
+            },
+            {
+              name: 'Trust Wallet',
+              redirectScheme: 'trust',
+              icon: '🛡',
+            },
+            {
+              name: 'SafePal',
+              redirectScheme: 'safe',
+              icon: '🔐',
+            },
+            {
+              name: 'OKX',
+              redirectScheme: 'okx',
+              icon: '⭕️',
+            },
+            {
+              name: 'Zerion',
+              redirectScheme: 'zerion',
+              icon: '🌐',
+            },
+            {
+              name: 'TokenPocket',
+              redirectScheme: 'tp',
+              icon: '💼',
+            },
+            {
+              name: 'Rainbow',
+              redirectScheme: 'rainbow',
+              icon: '🌈',
+            },
+            {
+              name: 'Other wallets',
+              redirectScheme: 'safe',
+              icon: '👜',
+            },
+          ];
+        
+          // Create clickable wallet connection links using redirect
+          const walletLinksText = walletLinks
+            .map(
+              (wallet) =>
+                `${wallet.icon} [Connect with ${wallet.name}](${baseRedirectUrl}?wallet=${wallet.redirectScheme}&uri=${encodeURIComponent(
+                  uri
+                )})`
+            )
+            .join('\n');
+        
+          // Escape Markdown for raw URI
+          function escapeMarkdown(text) {
+            return text.replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
+          }
+        
+          const escapedUri = escapeMarkdown(uri);
+        
+          // Send the message with QR code, redirect links, and raw URI
+          await bot.sendPhoto(msg.chat.id, qrCodeImage, {
+            caption:
+              `Scan the QR Code or Quick Connect:\n\n` +
+              `${walletLinksText}\n\n` +
+              `OR directly paste this URI in your wallet:\n\`${escapedUri}\``,
+            parse_mode: 'MarkdownV2',
+            reply_markup: {
+              inline_keyboard: walletLinks.map((wallet) => [
+                {
+                  text: `${wallet.icon} Connect ${wallet.name}`,
+                  url: `${baseRedirectUrl}?wallet=${wallet.redirectScheme}&uri=${encodeURIComponent(
+                    uri
+                  )}`,
+                },
+              ]),
+            },
+          });
+                
+        
         // Poll for session status
         const maxAttempts = 60; // 1 minute timeout
         let attempts = 0;
@@ -270,7 +372,7 @@ async function initBot() {
               );
   
               await bot.editMessageText(
-                `Wallet connected successfully!\nAddress: ${address}\nYou can now use /send to make transactions.`,
+                `Wallet connected successfully!\nAddress: ${address}\nYou can now use /openmarket to place orders.`,
                 {
                   chat_id: msg.chat.id,
                   message_id: statusMessage.message_id
@@ -291,7 +393,7 @@ async function initBot() {
             console.error('Status check error:', error);
           }
   
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          await new Promise(resolve => setTimeout(resolve, 3000));
           attempts++;
         }
   
@@ -329,7 +431,7 @@ async function handleApprove(bot,msg) {
     const [, amount] = msg.text.split(' ');
 
     if (!amount) {
-        await bot.sendMessage(msg.chat.id, 'Please provide amount to spend: /send <amount>');
+        await bot.sendMessage(msg.chat.id, 'Please provide amount to spend: /approve <amount>');
         return;
       }
 
@@ -381,7 +483,7 @@ async function handleApprove(bot,msg) {
           },
         });
   
-        await bot.sendMessage(msg.chat.id, `Trade transaction submitted! Hash: ${result} \n Waiting for confirmation...`);
+        await bot.sendMessage(msg.chat.id, `Approve transaction submitted! Hash: ${result} \n Waiting for confirmation...`);
    
   
     } catch (error) {
@@ -389,9 +491,7 @@ async function handleApprove(bot,msg) {
     }
 }
 
-
-// console.log(MAX_TP(3353,30))
-// Updated handleLimitTrade function
+// handleLimitTrade function
 async function handleLimitTrade(bot, msg) {
   try {
     const userSession = await getUserSession(msg.chat.id);
@@ -687,8 +787,10 @@ async function handleMarketTrade(bot, msg) {
                 }
 
                 if (check_allowance < ethers.parseUnits(size.toString(), 6)) {
-                  throw `Allowance of ${ethers.formatUnits(check_allowance, 6)} is less than ${size}`;
+                  throw `Allowance of ${ethers.formatUnits(check_allowance, 6)} is less than ${size}, Increase allowance using /approve <amount in $> command`;
                 }
+
+                console.log("Returned Stop Loss:",(calculateStopLoss(Price, stopLoss, leverage, buy)).toFixed(3))
 
                 const adjustedStopLoss = (calculateStopLoss(Price, stopLoss, leverage, buy)).toFixed(3);
                 //const takeProfit = MAX_TP(Price, leverage, buy);
@@ -759,8 +861,8 @@ async function handleMarketTrade(bot, msg) {
 
                 await bot.sendMessage(slMsg.chat.id, "Trade order stored successfully! Use /opentrades to view your orders.");
               } catch (error) {
-                console.error("Open trade error:", error);
-                await bot.sendMessage(slMsg.chat.id, `Failed to open trade. Error: ${error}`);
+                console.error("Open trade error:", error.message);
+                await bot.sendMessage(slMsg.chat.id, `Failed to open trade. Error: ${error.message}`);
               }
             });
           });
@@ -817,12 +919,17 @@ async function handleGetTrades(bot, msg, contractInstance) {
         const pairName = pairs_with_index_number[parseInt((trade.pairIndex).toString())] || "Unknown Pair";
 
         
-        const profit_loss_ = profit_loss(ethers.formatUnits(trade.openPrice, 10),trade.buy,ethers.formatUnits(trade.leverage, 10),pairName,ethers.formatUnits(trade.marginFee,6),ethers.formatUnits(trade.initialPosToken, 6))
-        console.log(profit_loss_)
+        const openPrice = ethers.formatUnits(trade.openPrice, 10);
+        const currentPrices = await price({ id: [feedIds[pairName.toUpperCase()].id] })
+        
         const tradeMessage = `
         🚀 TRADE INSIGHTS 📊
 
         ${trade.buy ? "🟢 LONG" : "🔴 SHORT"} | ${pairName.toUpperCase()}
+
+        ✨ Position State 
+        ────────────────────
+        ${trade.buy?(openPrice<currentPrices?"Profit 🤑":"Loss 😞"):(openPrice>currentPrices?"Profit 🤑":"Loss 😞")}
 
         💰 Position Details
         ────────────────────
@@ -831,10 +938,13 @@ async function handleGetTrades(bot, msg, contractInstance) {
 
         🎯 Trade Markers
         ────────────────────
-        🔹 Open Price: ${ethers.formatUnits(trade.openPrice, 10)}
+        🔹 Open Price: ${parseFloat(openPrice).toFixed(4)}
+        💹 Current Price: ${parseFloat(currentPrices).toFixed(4) || "NaN"}
+         
         🚦 Take Profit: ${ethers.formatUnits(trade.tp, 10)}
         ⚠️ Stop Loss: ${ethers.formatUnits(trade.sl, 10)}
         💥 Liquidation: ${ethers.formatUnits(trade.liquidationPrice, 10)}
+
 
         ${trade.buy ? "🚀 Riding the Bullish Wave" : "🐻 Navigating Bearish Currents"}
 
@@ -1113,14 +1223,59 @@ async function storeTrade(chatId, orderId, txHash) {
  
 // Other functions (handleViewTrades, getUserSession, saveUserSession, etc.) remain the same...
 
-// Start the bot
-(async (params) => {
-  try {
-    initBot().catch(console.error.data);
+// Start the bot with enhanced error handling and recovery
+(async () => {
+  async function startBot() {
+    try {
+      await initBot();
+    } catch (error) {
+      console.error('Bot initialization failed:', error);
+      // Implement exponential backoff retry
+      const maxRetries = 5;
+      for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+          const backoffDelay = Math.pow(2, attempt) * 1000; // Exponential backoff
+          console.warn(`Attempting to restart bot (Attempt ${attempt}/${maxRetries}) in ${backoffDelay/1000} seconds`);
+          
+          await new Promise(resolve => setTimeout(resolve, backoffDelay));
+          await initBot();
+          return; // Successfully started, exit retry loop
+        } catch (retryError) {
+          console.error(`Restart attempt ${attempt} failed:`, retryError);
+          
+          // If it's the last attempt, log final error but continue running
+          if (attempt === maxRetries) {
+            console.error('All bot restart attempts failed. Continuing with periodic retry.');
+          }
+        }
+      }
 
-  } catch (error) {
-    console.log(error.message)
+      // Continue trying to restart periodically even after max retries
+      setInterval(async () => {
+        try {
+          await initBot();
+          console.log('Bot successfully restarted after persistent failure');
+        } catch (persistentError) {
+          console.error('Periodic restart attempt failed:', persistentError);
+        }
+      }, 5 * 60 * 1000); // Try every 5 minutes
+    }
   }
-})()
 
+  // Global error handlers to prevent process termination
+  process.on('uncaughtException', (error) => {
+    console.error('Uncaught Exception:', error);
+    // Attempt to restart
+    startBot();
+  });
+
+  process.on('unhandledRejection', (reason, promise) => {
+    console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+    // Attempt to restart
+    startBot();
+  });
+
+  // Initial bot start
+  await startBot();
+})();
 
