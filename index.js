@@ -102,20 +102,39 @@ async function initBot() {
     bot.onText(/\/connect/, (msg) => handleConnect(bot, msg));
     bot.onText(/\/openlimit/, (msg) => handleLimitTrade(bot, msg));
     bot.onText(/\/trades/, (msg) => handleViewTrades(bot, msg));
-    bot.onText(/\/approve/, (msg) => handleApprove(bot, msg));
     bot.onText(/\/openmarket/, (msg) => handleMarketTrade(bot, msg));
     bot.onText(/\/verify/, (msg) => handleVerifyConnection(bot, msg));
     bot.onText(/\/opentrades/, (msg) => handleGetTrades(bot, msg, CONTRACT_INSTANCE_MULTICALL));
+    bot.onText(/\/disconnect/, (msg) => handleDisconnect(bot, msg));
+    bot.onText(/\/approve(?: (\d+(\.\d+)?))?/, async (msg, match) => {
+      const chatId = msg.chat.id;
+      const amount = match[1]; // Extract amount if provided
+      
+      if (!amount) {
+        await bot.sendMessage(chatId, "❌ Please specify the amount. For example, `/approve 100`", { parse_mode: "Markdown" });
+        return;
+      }
+    
+      try {
+        await handleApprove(bot, msg, parseFloat(amount));
+        await bot.sendMessage(chatId, `✅ Approved ${amount} USDC for spending.`);
+      } catch (error) {
+        console.error("Error during approval:", error);
+        await bot.sendMessage(chatId, "❌ Failed to process approval. Please try again.");
+      }
+    });
+
   
     await bot.setMyCommands([
-        { command: '/start', description: 'Start the bot' },
-        { command: '/connect', description: 'Connect your wallet' },
-        { command: '/verify', description: 'Verify wallet connection'},
-        { command: '/openlimit', description: 'Open a new Limit order for selected pair' },
-        { command: '/opentrades', description: 'View your recent trades'},
-        { command: '/approve', description: 'Approve spending limit of Contract' },
-        { command: '/openmarket', description: 'Open a Market trade for the selected pair' },
-      ]);
+      { command: '/start', description: 'Start the bot' },
+      { command: '/connect', description: 'Connect your wallet' },
+      { command: '/verify', description: 'Verify wallet connection' },
+      { command: '/openlimit', description: 'Open a new Limit order for selected pair' },
+      { command: '/opentrades', description: 'View your recent trades' },
+      { command: '/approve', description: 'Approve spending limit of Contract (e.g., /approve 100)' },
+      { command: '/openmarket', description: 'Open a Market trade for the selected pair' },
+      { command: '/disconnect', description: 'Disconnects wallet session.' },
+    ]);
     
       bot.on("callback_query", async (query) => {
         if (query.data.startsWith("close_trade:")) {
@@ -197,7 +216,28 @@ async function initBot() {
     await bot.sendMessage(msg.chat.id, welcomeMessage);
   }
   
-
+  async function handleDisconnect(bot,msg) {
+    try {
+      const existingSession = await getUserSession(msg.chat.id);
+      if (existingSession && existingSession.topic) {
+        try {
+          const session = await makeWalletConnectRequest(`/session/${existingSession.topic}`, 'DELETE');
+          console.log(session)
+          if(session.success=true){
+            await bot.sendMessage(
+              msg.chat.id,
+              `Your wallet session has been disconnected.  
+            To start a new session, please use the /connect command.`
+            );
+                      }
+        } catch (error) {
+          console.log('Error disconnecting existing session:', error);
+        }
+      }
+    } catch (error) {
+      await bot.sendMessage(msg.chat.id, 'Error occured while disconnecting try again.');
+    }
+  }
   async function handleConnect(bot, msg) {
     try {
       const existingSession = await getUserSession(msg.chat.id);
@@ -211,62 +251,10 @@ async function initBot() {
   
       // Request new connection
       const { uri, topic } = await makeWalletConnectRequest('/connect', 'POST');
-  
-      /*if (uri) {
-        const qrCodeImage = await QRCode.toBuffer(uri);
-        const statusMessage = await bot.sendMessage(msg.chat.id, 'Connecting wallet...');
-  
-        // Wallet-specific deep links
-        const walletLinks = [
-          {
-            name: 'MetaMask',
-            link: `https://t.me/iv?url=${encodeURIComponent(`metamask://wc?uri=${uri}`)}&rhash=...`, // You'll need to get the rhash from Telegram
-            icon: '🦊'
-          },
-          {
-            name: 'Trust Wallet',
-            link: `https://t.me/iv?url=${encodeURIComponent(`trust://wc?uri=${uri}`)}&rhash=...`,
-            icon: '🛡️'
-          }
-        ];
-        // Create clickable wallet connection links
-        const walletLinksText = walletLinks.map(wallet => 
-          `${wallet.icon} [Connect with ${wallet.name}](${wallet.link})`
-          
-        ).join('\n');
-        
-        function escapeMarkdown(text) {
-          return text.replace(/[_*[\]]/g, '\\$&');
-        }
-        
-        const escapedUri = escapeMarkdown(uri);
-        
-        await bot.sendPhoto(msg.chat.id, qrCodeImage, {
-          caption: 
-            `Scan QR Code or Quick Connect:\n\n` +
-            `${walletLinksText}\n\n` +
-            `Scan the QR code or tap a wallet link to connect.\n` +
-            `OR Directly paste this URI in your wallet: \`${escapedUri}\``, // Highlight the URI
-          parse_mode: "Markdown",
-          reply_markup: {
-            inline_keyboard: walletLinks.map(wallet => [
-              {
-                text: `${wallet.icon} Connect ${wallet.name}`,
-                url: wallet.link
-              }
-            ])
-          }
-        });
-
-        */
-
 
         if (uri) {
           // Generate QR Code
-          const qrCodeImage = await QRCode.toBuffer(uri);
-
-          const statusMessage = await bot.sendMessage(msg.chat.id, 'Connecting wallet...');
-        
+          const qrCodeImage = await QRCode.toBuffer(uri);        
           // Base redirect URL
           const baseRedirectUrl = 'https://bvvvp009.github.io/wallet-connect-reconnect/redirect.html';
         
@@ -349,10 +337,17 @@ async function initBot() {
               ]),
             },
           });
-                
-        
+          
+          const statusMessage = await bot.sendMessage(
+            msg.chat.id,
+            `Please select a wallet to connect.  
+          This session will remain active for only 1 minute.  
+          If the session expires, you can restart it anytime use /connect command.`
+          );
+          
+
         // Poll for session status
-        const maxAttempts = 60; // 1 minute timeout
+        const maxAttempts = 30; // 1 minute timeout
         let attempts = 0;
         
         while (attempts < maxAttempts) {
@@ -427,69 +422,179 @@ async function initBot() {
     }
   }
 
-async function handleApprove(bot,msg) {
+  async function handleApprove(bot, msg) {
     const [, amount] = msg.text.split(' ');
-
+  
     if (!amount) {
-        await bot.sendMessage(msg.chat.id, 'Please provide amount to spend: /approve <amount>');
+      await bot.sendMessage(msg.chat.id, 'Please provide amount to spend: /approve <amount>');
+      return;
+    }
+  
+    try {
+      const userSession = await getUserSession(msg.chat.id);
+      if (!userSession || !userSession.topic || !userSession.address) {
+        await bot.sendMessage(msg.chat.id, 'Please connect your wallet first using /connect');
         return;
       }
+  
+      // Check current allowance
+      const currentAllowance = await CONTRACT_INSTANCE_USDC.allowance(userSession.address, SPENDER_APPROVE);
+      console.log(`Current Allowance: ${ethers.formatUnits(currentAllowance, 6)} USDC`);
+  
+      // Verify wallet session
+      try {
+        await makeWalletConnectRequest(`/session/${userSession.topic}`, 'GET');
+      } catch (error) {
+        await bot.sendMessage(msg.chat.id, 'Your wallet session has expired. Please reconnect using /connect');
+        return;
+      }
+  
+      // Validate input amount
+      const parseAmount = parseFloat(amount);
+      if (isNaN(parseAmount) || parseAmount <= 0) {
+        await bot.sendMessage(msg.chat.id, 'Invalid amount. Please enter a positive number.');
+        return;
+      }
+  
+      // Check user's USDC balance
+      const userBalance = await CONTRACT_INSTANCE_USDC.balanceOf(userSession.address);
+      const requestedAllowance = ethers.parseUnits(amount.toString(), 6);
 
-    try {
-        const userSession = await getUserSession(msg.chat.id);
-        if (!userSession || !userSession.topic || !userSession.address) {
-          await bot.sendMessage(msg.chat.id, 'Please connect your wallet first using /connect');
-          return;
-        }
-        const check_allowance = await CONTRACT_INSTANCE_USDC.allowance(userSession.address,SPENDER_APPROVE);
-        console.log(check_allowance,"hnn")
-
-        try {
-            await makeWalletConnectRequest(`/session/${userSession.topic}`, 'GET');
-            console.log('initialized')
-          } catch (error) {
-            await bot.sendMessage(msg.chat.id, 'Your wallet session has expired. Please reconnect using /connect');
-            return;
-          }
-     
-          const approveParams = {
-              spender: SPENDER_APPROVE,
-              allowance: ethers.parseUnits(amount?.toString(),6)
-            };
-          
-            const iface = new ethers.Interface(USDC_ABI);
-            console.log(iface)
-            const data = iface.encodeFunctionData("approve", [
-             
-                approveParams.spender,
-                approveParams.allowance,
-                
-            ]);
-
-            console.log(data)
+      if (userBalance < requestedAllowance) {
+        await bot.sendMessage(msg.chat.id, 
+          `Insufficient USDC balance!\n` +
+          `Current Balance: ${ethers.formatUnits(userBalance, 6)} USDC\n` +
+          `Requested Allowance: ${amount} USDC\n` +
+          `Current Allowance: ${ethers.formatUnits(currentAllowance, 6)} USDC`
+        );
+        return; // This ensures NO further code execution
+      }
+  
+      // Prepare approve parameters
+      const approveParams = {
+        spender: SPENDER_APPROVE,
+        allowance: requestedAllowance
+      };
       
-        await bot.sendMessage(msg.chat.id, 'Approve spending to the contract. Please check your wallet for approval...');
+      // Encode approve function call
+      const iface = new ethers.Interface(USDC_ABI);
+      const data = iface.encodeFunctionData("approve", [
+        approveParams.spender,
+        approveParams.allowance
+      ]);
   
-        const { result } = await makeWalletConnectRequest(`/request/${userSession.topic}`, 'POST', {
-          chainId: `eip155:${BASE_CHAIN_ID}`,
-          request: {
-            method: 'eth_sendTransaction',
-            params: [{
-              from: userSession.address,
-              to: USDC_CONTRACT_ON_BASE,
-              data: data,
-              value: '0x0'
-            }],
-          },
-        });
+      // Send initial confirmation message
+      const initialMessage = await bot.sendMessage(msg.chat.id, 
+        `Requesting approval for ${amount} USDC\n` +
+        `Spender: ${SPENDER_APPROVE}\n` +
+        'Please check your wallet for approval...'
+      );
   
-        await bot.sendMessage(msg.chat.id, `Approve transaction submitted! Hash: ${result} \n Waiting for confirmation...`);
-   
+      // Send transaction request
+      const { result } = await makeWalletConnectRequest(`/request/${userSession.topic}`, 'POST', {
+        chainId: `eip155:${BASE_CHAIN_ID}`,
+        request: {
+          method: 'eth_sendTransaction',
+          params: [{
+            from: userSession.address,
+            to: USDC_CONTRACT_ON_BASE,
+            data: data,
+            value: '0x0'
+          }],
+        },
+      });
+  
+      // Wait for blockchain confirmations
+      let confirmations = 0;
+      const maxWaitTime = 5 * 60 * 1000; // 5 minutes
+      const startTime = Date.now();
+  
+      const checkConfirmations = async () => {
+        try {
+          // Get transaction receipt
+          const receipt = await Provider.getTransactionReceipt(result);
+      
+          if (receipt) {
+            console.log('Transaction Receipt:', receipt);
+            
+            // Check transaction status
+            console.log('Transaction Status:', receipt.status);
+            
+            // Explicitly check confirmations
+            const currentBlock = await Provider.getBlockNumber();
+            const confirmations = currentBlock - receipt.blockNumber;
+      
+            console.log(`Current Block: ${currentBlock}`);
+            console.log(`Transaction Block: ${receipt.blockNumber}`);
+            console.log(`Confirmations: ${confirmations}`);
+      
+            // Modify confirmation check logic
+            if (confirmations >= 1) {
+              console.log(`✅ Transaction confirmed with ${confirmations} confirmations.`);
+      
+              // Verify new allowance after confirmation
+              const newAllowance = await CONTRACT_INSTANCE_USDC.allowance(userSession.address, SPENDER_APPROVE);
+      
+              // Update message to confirmed
+              await bot.editMessageText(
+                `Approval Confirmed! ✅\n` +
+                `Transaction Hash: ${result}\n` +
+                `Confirmations: ${confirmations}\n` +
+                `New Allowance: ${ethers.formatUnits(newAllowance, 6)} USDC`,
+                {
+                  chat_id: msg.chat.id,
+                  message_id: initialMessage.message_id
+                }
+              );
+      
+              return true;
+            } else {
+              console.log('⏳ Transaction is pending confirmation.');
+            }
+          } else {
+            console.error('❌ Transaction receipt not found. It might still be pending.');
+          }
+      
+          // If not enough confirmations and not timed out, check again
+          if (Date.now() - startTime < maxWaitTime) {
+            setTimeout(checkConfirmations, 5000); // Check every 5 seconds
+          } else {
+            // Timeout occurred
+            await bot.editMessageText(
+              `Approval transaction timed out. Please check transaction status manually.\n` +
+              `Transaction Hash: ${result}`,
+              {
+                chat_id: msg.chat.id,
+                message_id: initialMessage.message_id
+              }
+            );
+          }
+        } catch (error) {
+          console.error("Confirmation check error:", error);
+          await bot.editMessageText(
+            `Error checking transaction confirmation.\n` +
+            `Transaction Hash: ${result}`,
+            {
+              chat_id: msg.chat.id,
+              message_id: initialMessage.message_id
+            }
+          );
+        }
+      };
+      // Start confirmation checking
+      await checkConfirmations();
   
     } catch (error) {
-        
+      console.error("Approve transaction error:", error);
+      
+      let errorMessage = 'Failed to process approval.';
+      if (error.message) {
+        errorMessage += ` Error: ${error.message}`;
+      }
+  
+      await bot.sendMessage(msg.chat.id, errorMessage);
     }
-}
+  }
 
 // handleLimitTrade function
 async function handleLimitTrade(bot, msg) {
@@ -515,9 +620,8 @@ async function handleLimitTrade(bot, msg) {
       }
 
       const Price = await price({ id: [feedIds[selectedPair].id] });
-      const maxLevearage = feedIds[selectedPair].leverage || "NaN"
+      const maxLeverage = feedIds[selectedPair].leverage || "NaN";
 
-     
       // Ask for Long or Short
       const options = {
         reply_markup: JSON.stringify({
@@ -542,153 +646,273 @@ async function handleLimitTrade(bot, msg) {
         bot.once("message", async (sizeMsg) => {
           const size = sizeMsg.text;
 
+          // Validate size input
           if (isNaN(size) || parseFloat(size) <= 0) {
             await bot.sendMessage(sizeMsg.chat.id, "Invalid size. Please enter a valid number.");
             return;
           }
 
-          await bot.sendMessage(sizeMsg.chat.id, `Size: ${size} USDC. Now enter leverage: \nMax leverage for this pair is ${maxLevearage}x`);
-
-          // Step 5: Wait for leverage input
-          bot.once("message", async (leverageMsg) => {
-            const leverage = leverageMsg.text;
-
-            if (isNaN(leverage) || parseFloat(leverage) <= 0) {
-              await bot.sendMessage(leverageMsg.chat.id, "Invalid leverage. Please enter a valid number.");
+          // Check wallet balance and allowance
+          try {
+            const check_balance = await CONTRACT_INSTANCE_USDC.balanceOf(userSession.address);
+            const check_allowance = await CONTRACT_INSTANCE_USDC.allowance(userSession.address, SPENDER_APPROVE);
+            
+            const requiredAmount = ethers.parseUnits(size.toString(), 6);
+            
+            // Check balance
+            if (check_balance < requiredAmount) {
+              await bot.sendMessage(sizeMsg.chat.id, 
+                `Insufficient balance!\n` +
+                `Available Balance: ${ethers.formatUnits(check_balance, 6)} USDC\n` +
+                `Required Amount: ${size} USDC`
+              );
               return;
             }
 
-            let text;
-
-            if(buy){
-              text = `Below ${Price} $.`
-            }else {
-              text = `Above ${Price} $.`
+            // Check allowance
+            if (check_allowance < requiredAmount) {
+              await bot.sendMessage(sizeMsg.chat.id, 
+                `Insufficient allowance!\n` +
+                `Current Allowance: ${ethers.formatUnits(check_allowance, 6)} USDC\n` +
+                `Required Allowance: ${size} USDC\n` +
+                `Please use /approve <amount> command to increase allowance.`
+              );
+              return;
             }
 
-            await bot.sendMessage(leverageMsg.chat.id, `Leverage: ${leverage}x \n Present Trading price of selected pair: ${parseFloat(Price).toFixed(2)}$\n Enter the Limit Price ${text}:`);
+            await bot.sendMessage(sizeMsg.chat.id, `Size: ${size} USDC. Now enter leverage:\nMax leverage for this pair is ${maxLeverage}x`);
 
-           
+            // Step 5: Wait for leverage input
+            bot.once("message", async (leverageMsg) => {
+              const leverage = leverageMsg.text;
 
-            // Step 6: Wait for limit price input
-            bot.once("message", async (priceMsg) => {
-              const limitPrice = priceMsg.text;
-
-              if (isNaN(limitPrice) || parseFloat(limitPrice) <= 0) {
-                await bot.sendMessage(priceMsg.chat.id, "Invalid limit price. Please enter a valid number.");
+              if (isNaN(leverage) || parseFloat(leverage) <= 0 || parseFloat(leverage) > maxLeverage) {
+                await bot.sendMessage(leverageMsg.chat.id, `Invalid leverage. Please enter a valid number between 1 and ${maxLeverage}x`);
                 return;
               }
 
-              await bot.sendMessage(priceMsg.chat.id, `Limit Price: ${parseFloat(limitPrice).toFixed(3)}$.\n Now enter Stop-Loss:`);
+              let text;
+              if(buy){
+                text = `Below ${Price} $.`
+              } else {
+                text = `Above ${Price} $.`
+              }
 
-              // Step 7: Wait for Stop-Loss input
-              bot.once("message", async (slMsg) => {
-                const stopLoss = slMsg.text;
+              await bot.sendMessage(leverageMsg.chat.id, `Leverage: ${leverage}x \n Present Trading price of selected pair: ${parseFloat(Price).toFixed(2)}$\n Enter the Limit Price ${text}:`);
 
-                if (isNaN(stopLoss) || parseFloat(stopLoss) <= 0) {
-                  await bot.sendMessage(slMsg.chat.id, "Invalid Stop-Loss. Please enter a valid number.");
+              // Step 6: Wait for limit price input
+              bot.once("message", async (priceMsg) => {
+                const limitPrice = priceMsg.text;
+
+                if (isNaN(limitPrice) || parseFloat(limitPrice) <= 0) {
+                  await bot.sendMessage(priceMsg.chat.id, "Invalid limit price. Please enter a valid number.");
                   return;
                 }
 
-                await bot.sendMessage(slMsg.chat.id, `Stop-Loss: ${stopLoss}$. \n Preparing to open trade...`);
+                // Prompt for Stop-Loss and Take-Profit
+                const slTpOptions = {
+                  reply_markup: JSON.stringify({
+                    inline_keyboard: [
+                      [
+                        { text: "Yes, I want to set Stop-Loss/Take-Profit", callback_data: "sl_tp:yes" },
+                        { text: "No, use default (0)", callback_data: "sl_tp:no" }
+                      ]
+                    ]
+                  })
+                };
 
-                try {
-                  // Validate wallet
-                  const check_allowance = await CONTRACT_INSTANCE_USDC.allowance(userSession.address, SPENDER_APPROVE);
-                  const check_balance = await CONTRACT_INSTANCE_USDC.balanceOf(userSession.address);
+                await bot.sendMessage(priceMsg.chat.id, "Do you want to set Stop-Loss and Take-Profit?", slTpOptions);
 
-                  if (check_balance < ethers.parseUnits(size.toString(), 6)) {
-                    throw `Available Balance: ${ethers.formatUnits(check_balance, 6)}$ \n Required Balance: ${size}$`;
+                // Step 7: Handle Stop-Loss and Take-Profit selection
+                bot.once("callback_query", async (slTpCallback) => {
+                  const [action, choice] = slTpCallback.data.split(":");
+                  const chatId = slTpCallback.message.chat.id;
+
+                  if (choice === "no") {
+                    // Proceed with default 0 for stop-loss and take-profit
+                    await proceedWithLimitTrade(bot, chatId, selectedPair, size, leverage, limitPrice, Price, buy, 0, 0);
+                  } else {
+                    // Prompt for Stop-Loss
+                    await bot.sendMessage(chatId, `Enter stop-loss price:`);
+
+                    bot.once("message", async (slMsg) => {
+                      const stopLoss = slMsg.text;
+
+                      if (isNaN(stopLoss) || parseFloat(stopLoss) <= 0) {
+                        await bot.sendMessage(slMsg.chat.id, "Invalid stop-loss. Please enter a valid number.");
+                        return;
+                      }
+
+                      // Prompt for Take-Profit
+                      await bot.sendMessage(slMsg.chat.id, "Enter take-profit price (or 0 to skip):");
+
+                      bot.once("message", async (tpMsg) => {
+                        const takeProfit = tpMsg.text;
+
+                        if (isNaN(takeProfit) || parseFloat(takeProfit) < 0) {
+                          await bot.sendMessage(tpMsg.chat.id, "Invalid take-profit. Please enter a valid price or 0.");
+                          return;
+                        }
+
+                        // Proceed with trade
+                        await proceedWithLimitTrade(bot, tpMsg.chat.id, selectedPair, size, leverage, limitPrice, Price, buy, stopLoss, takeProfit);
+                      });
+                    });
                   }
-
-                  if (check_allowance < ethers.parseUnits(size.toString(), 6)) {
-                    throw `Allowance of ${ethers.formatUnits(check_allowance, 6)}$ is less than ${size}$`;
-                  }
-
-                  // Calculate TP and adjusted SL
-                  const adjustedStopLoss = (calculateStopLoss(limitPrice, stopLoss, leverage, buy));
-                  const trimmed_stopLoss = adjustedStopLoss.toFixed(3)
-
-
-                  // Prepare trade parameters
-                  const tradeParams = {
-                    trader: userSession.address,
-                    pairIndex: PAIRS_OBJECT[selectedPair], // Map `selectedPair` to pairIndex
-                    index: 0,
-                    initialPosToken: 0,
-                    positionSizeUSDC: ethers.parseUnits(size, 6),
-                    openPrice: ethers.parseUnits(limitPrice, 10),
-                    buy: buy, // Buy/Sell direction
-                    leverage: ethers.parseUnits(leverage, 10),
-                    tp: 0,
-                    sl: ethers.parseUnits(trimmed_stopLoss.toString(), 10),
-                    timestamp: Math.floor(Date.now() / 1000),
-                  };
-
-                  const type = 2; // Limit order
-                  const slippageP = ethers.parseUnits("1", 10); // 0.3%
-                  const executionFee = 0;
-
-                  // Encode function call
-                  const iface = new ethers.Interface(TRADING_ABI);
-                  const data = iface.encodeFunctionData("openTrade", [
-                    [
-                      tradeParams.trader,
-                      tradeParams.pairIndex,
-                      tradeParams.index,
-                      tradeParams.initialPosToken,
-                      tradeParams.positionSizeUSDC,
-                      tradeParams.openPrice,
-                      tradeParams.buy,
-                      tradeParams.leverage,
-                      tradeParams.tp,
-                      tradeParams.sl,
-                      tradeParams.timestamp,
-                    ],
-                    type,
-                    slippageP,
-                    executionFee,
-                  ]);
-
-                  await bot.sendMessage(slMsg.chat.id, "Check your wallet for approval...");
-
-                  const { result } = await makeWalletConnectRequest(`/request/${userSession.topic}`, "POST", {
-                    chainId: `eip155:${BASE_CHAIN_ID}`,
-                    request: {
-                      method: "eth_sendTransaction",
-                      params: [
-                        {
-                          from: userSession.address,
-                          to: CONTRACT_ADDRESS_TRADING,
-                          data: data,
-                          value: "0x0",
-                        },
-                      ],
-                    },
-                  });
-
-                  await bot.sendMessage(slMsg.chat.id, `Trade transaction submitted! Hash: ${result}\n Waiting for confirmation...`);
-
-                  const mockOrderId = Date.now().toString();
-                  await storeTrade(slMsg.chat.id, mockOrderId, result);
-
-                  await bot.sendMessage(slMsg.chat.id, "Trade order stored successfully! Use /opentrades to view your orders.");
-                } catch (error) {
-                  console.error("Open trade error:", error);
-                  await bot.sendMessage(slMsg.chat.id, `Failed to open trade. Error: ${error}`);
-                }
+                });
               });
             });
-          });
+          } catch (balanceError) {
+            console.error("Balance/Allowance check error:", balanceError);
+            await bot.sendMessage(sizeMsg.chat.id, "Error checking wallet balance. Please try again.");
+          }
         });
       });
     });
   } catch (error) {
     console.error("Handle limit trade error:", error);
-    await bot.sendMessage(msg.chat.id, "An error occurred. Please try again.");
+    await bot.sendMessage(msg.chat.id, "Failed to open limit trade, Please try agian. ");
   }
 }
 
+// New function to handle limit trade execution with blockchain confirmation
+async function proceedWithLimitTrade(bot, chatId, selectedPair, size, leverage, limitPrice, currentPrice, buy, stopLoss, takeProfit) {
+  try {
+    const userSession = await getUserSession(chatId);
+
+    // Calculate adjusted stop-loss
+    const adjustedStopLoss = (calculateStopLoss(limitPrice, stopLoss, leverage, buy)).toFixed(3);
+
+    // Prepare trade parameters
+    const tradeParams = {
+      trader: userSession.address,
+      pairIndex: PAIRS_OBJECT[selectedPair],
+      index: 0,
+      initialPosToken: 0,
+      positionSizeUSDC: ethers.parseUnits(size, 6),
+      openPrice: ethers.parseUnits(limitPrice, 10),
+      buy: buy,
+      leverage: ethers.parseUnits(leverage, 10),
+      tp: takeProfit ? ethers.parseUnits(takeProfit.toString(), 10) : 0,
+      sl: stopLoss ? ethers.parseUnits(adjustedStopLoss.toString(), 10) : 0,
+      timestamp: Math.floor(Date.now() / 1000),
+    };
+
+    const type = 2; // Limit order
+    const slippageP = ethers.parseUnits("1", 10); // 0.3%
+    const executionFee = 0;
+
+    // Encode function call
+    const iface = new ethers.Interface(TRADING_ABI);
+    const data = iface.encodeFunctionData("openTrade", [
+      [
+        tradeParams.trader,
+        tradeParams.pairIndex,
+        tradeParams.index,
+        tradeParams.initialPosToken,
+        tradeParams.positionSizeUSDC,
+        tradeParams.openPrice,
+        tradeParams.buy,
+        tradeParams.leverage,
+        tradeParams.tp,
+        tradeParams.sl,
+        tradeParams.timestamp,
+      ],
+      type,
+      slippageP,
+      executionFee,
+    ]);
+
+    // Send transaction request
+    const { result } = await makeWalletConnectRequest(`/request/${userSession.topic}`, "POST", {
+      chainId: `eip155:${BASE_CHAIN_ID}`,
+      request: {
+        method: "eth_sendTransaction",
+        params: [
+          {
+            from: userSession.address,
+            to: CONTRACT_ADDRESS_TRADING,
+            data: data,
+            value: "0x0",
+          },
+        ],
+      },
+    });
+
+    // Initial message about transaction submission
+    const initialMessage = await bot.sendMessage(
+      chatId,
+      `Limit trade transaction submitted! Hash: ${result}\nWaiting for blockchain confirmation...`
+    );
+
+    // Wait for blockchain confirmations
+    let confirmations = 0;
+    const maxWaitTime = 5 * 60 * 1000; // 5 minutes
+    const startTime = Date.now();
+
+    const checkConfirmations = async () => {
+      try {
+        const receipt = await provider.getTransactionReceipt(result);
+        
+        if (receipt) {
+          confirmations = receipt.confirmations || 0;
+          
+          if (confirmations >= 2) {
+            // Update message to confirmed
+            await bot.editMessageText(
+              `Limit Trade confirmed on blockchain! ✅\n` +
+              `Transaction Hash: ${result}\n` +
+              `Confirmations: ${confirmations}\n` +
+              `Check your open trades using /opentrades`,
+              {
+                chat_id: chatId,
+                message_id: initialMessage.message_id
+              }
+            );
+
+            // Store trade
+            const mockOrderId = Date.now().toString();
+            await storeTrade(chatId, mockOrderId, result);
+
+            return true;
+          }
+        }
+
+        // If not enough confirmations and not timed out, check again
+        if (Date.now() - startTime < maxWaitTime) {
+          setTimeout(checkConfirmations, 15000); // Check every 15 seconds
+        } else {
+          // Timeout occurred
+          await bot.editMessageText(
+            `Limit trade submission timed out. Please check transaction status manually.\n` +
+            `Transaction Hash: ${result}`,
+            {
+              chat_id: chatId,
+              message_id: initialMessage.message_id
+            }
+          );
+        }
+      } catch (error) {
+        console.error("Confirmation check error:", error);
+        await bot.editMessageText(
+          `Error checking transaction confirmation.\n` +
+          `Transaction Hash: ${result}`,
+          {
+            chat_id: chatId,
+            message_id: initialMessage.message_id
+          }
+        );
+      }
+    };
+
+    // Start confirmation checking
+    await checkConfirmations();
+
+  } catch (error) {
+    console.error("Open limit trade error:", error.message);
+    await bot.sendMessage(chatId, `Failed to open limit trade. Error: ${error.message}`);
+  }
+}
 
 
 async function handleMarketTrade(bot, msg) {
@@ -696,7 +920,7 @@ async function handleMarketTrade(bot, msg) {
     const userSession = await getUserSession(msg.chat.id);
 
     if (!userSession || !userSession.topic || !userSession.address) {
-      await bot.sendMessage(msg.chat.id, "Please connect your wallet first using /connect");
+      await bot.sendMessage(msg.chat.id, "Please connect your wallet first using /connect ");
       return;
     }
 
@@ -714,8 +938,7 @@ async function handleMarketTrade(bot, msg) {
       }
 
       const Price = await price({ id: [feedIds[selectedPair].id] });
-      const maxLevearage =  feedIds[selectedPair].leverage || "NaN";
-
+      const maxLeverage = feedIds[selectedPair].leverage || "NaN";
 
       // Ask for Long or Short
       const options = {
@@ -741,137 +964,263 @@ async function handleMarketTrade(bot, msg) {
         bot.once("message", async (sizeMsg) => {
           const size = sizeMsg.text;
 
+          // Validate size input
           if (isNaN(size) || parseFloat(size) <= 0) {
             await bot.sendMessage(sizeMsg.chat.id, "Invalid size. Please enter a valid number.");
             return;
           }
 
-          await bot.sendMessage(sizeMsg.chat.id, `Size: ${size} USDC. Now enter leverage:\nMax leverage for this pair is ${maxLevearage}x`);
-
-          let text;
-          if(buy){
-            text = `Below the market price of ${parseFloat(Price).toFixed(3)}`
-          }else {
-            text = `Above the market price of ${Price}`
-          }
-          // Step 5: Wait for leverage input
-          bot.once("message", async (leverageMsg) => {
-            const leverage = leverageMsg.text;
-           
-            if (isNaN(leverage) || parseFloat(leverage) <= 0) {
-              await bot.sendMessage(leverageMsg.chat.id, `Invalid leverage. Please enter a valid number. and Max leverage for this pair is ${maxLevearage}x`);
+          // Check wallet balance and allowance
+          try {
+            const check_balance = await CONTRACT_INSTANCE_USDC.balanceOf(userSession.address);
+            const check_allowance = await CONTRACT_INSTANCE_USDC.allowance(userSession.address, SPENDER_APPROVE);
+            
+            const requiredAmount = ethers.parseUnits(size.toString(), 6);
+            
+            // Check balance
+            if (check_balance < requiredAmount) {
+              await bot.sendMessage(sizeMsg.chat.id, 
+                `Insufficient balance!\n` +
+                `Available Balance: ${ethers.formatUnits(check_balance, 6)} USDC\n` +
+                `Required Amount: ${size} USDC`
+              );
               return;
             }
 
-            await bot.sendMessage(leverageMsg.chat.id, `Leverage: ${leverage}x. Now enter stop-loss (price) 
-              \n ${text} }:`);
+            // Check allowance
+            if (check_allowance < requiredAmount) {
+              await bot.sendMessage(sizeMsg.chat.id, 
+                `Insufficient allowance!\n` +
+                `Current Allowance: ${ethers.formatUnits(check_allowance, 6)} USDC\n` +
+                `Required Allowance: ${size} USDC\n` +
+                `Please use /approve <amount> command to increase allowance.`
+              );
+              return;
+            }
 
-            // Step 6: Wait for stop-loss input
-            bot.once("message", async (slMsg) => {
-              const stopLoss = slMsg.text;
+            await bot.sendMessage(sizeMsg.chat.id, `Size: ${size} USDC. Now enter leverage:\nMax leverage for this pair is ${maxLeverage}x`);
 
-              if (isNaN(stopLoss) || parseFloat(stopLoss) <= 0) {
-                await bot.sendMessage(slMsg.chat.id, "Invalid stop-loss. Please enter a valid price.");
+            // Step 5: Wait for leverage input
+            bot.once("message", async (leverageMsg) => {
+              const leverage = leverageMsg.text;
+             
+              if (isNaN(leverage) || parseFloat(leverage) <= 0 || parseFloat(leverage) > maxLeverage) {
+                await bot.sendMessage(leverageMsg.chat.id, `Invalid leverage. Please enter a valid number between 1 and ${maxLeverage}x`);
                 return;
               }
 
-              await bot.sendMessage(slMsg.chat.id, `Stop-Loss: ${stopLoss}. Preparing to open trade...`);
+              // Prompt for Stop-Loss and Take-Profit
+              const slTpOptions = {
+                reply_markup: JSON.stringify({
+                  inline_keyboard: [
+                    [
+                      { text: "Yes, I want to set Stop-Loss/Take-Profit", callback_data: "sl_tp:yes" },
+                      { text: "No, use default (0)", callback_data: "sl_tp:no" }
+                    ]
+                  ]
+                })
+              };
 
-              // Step 7: Validate wallet and initiate trade
-              try {
-                const check_allowance = await CONTRACT_INSTANCE_USDC.allowance(userSession.address, SPENDER_APPROVE);
-                const check_balance = await CONTRACT_INSTANCE_USDC.balanceOf(userSession.address);
+              await bot.sendMessage(leverageMsg.chat.id, "Do you want to set Stop-Loss and Take-Profit?", slTpOptions);
 
-                if (check_balance < ethers.parseUnits(size.toString(), 6)) {
-                  throw `Available Balance: ${ethers.formatUnits(check_balance, 6)}\nRequired Balance: ${size}`;
+              // Step 6: Handle Stop-Loss and Take-Profit selection
+              bot.once("callback_query", async (slTpCallback) => {
+                const [action, choice] = slTpCallback.data.split(":");
+                const chatId = slTpCallback.message.chat.id;
+
+                let text;
+                if(buy){
+                  text = `Below the market price of ${parseFloat(Price).toFixed(3)}`
+                } else {
+                  text = `Above the market price of ${parseFloat(Price).toFixed(3)}`
                 }
 
-                if (check_allowance < ethers.parseUnits(size.toString(), 6)) {
-                  throw `Allowance of ${ethers.formatUnits(check_allowance, 6)} is less than ${size}, Increase allowance using /approve <amount in $> command`;
+                if (choice === "no") {
+                  // Proceed with default 0 for stop-loss and take-profit
+                  await proceedWithTrade(bot, chatId, selectedPair, size, leverage, Price, buy, 0, 0);
+                } else {
+                  // Prompt for Stop-Loss
+                  await bot.sendMessage(chatId, `Enter stop-loss price ${text}:`);
+
+                  bot.once("message", async (slMsg) => {
+                    const stopLoss = slMsg.text;
+
+                    if (isNaN(stopLoss) || parseFloat(stopLoss) <= 0) {
+                      await bot.sendMessage(slMsg.chat.id, "Invalid stop-loss. Please enter a valid price.");
+                      return;
+                    }
+
+                    // Prompt for Take-Profit
+                    await bot.sendMessage(slMsg.chat.id, "Enter take-profit price (or 0 to skip):");
+
+                    bot.once("message", async (tpMsg) => {
+                      const takeProfit = tpMsg.text;
+
+                      if (isNaN(takeProfit) || parseFloat(takeProfit) < 0) {
+                        await bot.sendMessage(tpMsg.chat.id, "Invalid take-profit. Please enter a valid price or 0.");
+                        return;
+                      }
+
+                      // Proceed with trade
+                      await proceedWithTrade(bot, tpMsg.chat.id, selectedPair, size, leverage, Price, buy, stopLoss, takeProfit);
+                    });
+                  });
                 }
-
-                console.log("Returned Stop Loss:",(calculateStopLoss(Price, stopLoss, leverage, buy)).toFixed(3))
-
-                const adjustedStopLoss = (calculateStopLoss(Price, stopLoss, leverage, buy)).toFixed(3);
-                //const takeProfit = MAX_TP(Price, leverage, buy);
-                console.log("Price",Price,"\n Adjusted stop loss",adjustedStopLoss)
-                const tradeParams = {
-                  trader: userSession.address,
-                  pairIndex: PAIRS_OBJECT[selectedPair], // Map `selectedPair` to pairIndex based on backend logic
-                  index: 0,
-                  initialPosToken: 0,
-                  positionSizeUSDC: ethers.parseUnits(size, 6),
-                  openPrice: ethers.parseUnits(Price, 10),
-                  buy: buy,
-                  leverage: ethers.parseUnits(leverage, 10),
-                  tp: 0,
-                  sl: ethers.parseUnits(adjustedStopLoss.toString(), 10),
-                  timestamp: Math.floor(Date.now() / 1000),
-                };
-
-                const type = 0; // Market order
-                const slippageP = ethers.parseUnits("1", 10); // 0.3%
-                const executionFee = 0;
-
-                // Encode the function call
-                const iface = new ethers.Interface(TRADING_ABI);
-                const data = iface.encodeFunctionData("openTrade", [
-                  [
-                    tradeParams.trader,
-                    tradeParams.pairIndex,
-                    tradeParams.index,
-                    tradeParams.initialPosToken,
-                    tradeParams.positionSizeUSDC,
-                    tradeParams.openPrice,
-                    tradeParams.buy,
-                    tradeParams.leverage,
-                    tradeParams.tp,
-                    tradeParams.sl,
-                    tradeParams.timestamp,
-                  ],
-                  type,
-                  slippageP,
-                  executionFee,
-                ]);
-
-                await bot.sendMessage(slMsg.chat.id, "Check your wallet for approval...");
-
-                const { result } = await makeWalletConnectRequest(`/request/${userSession.topic}`, "POST", {
-                  chainId: `eip155:${BASE_CHAIN_ID}`,
-                  request: {
-                    method: "eth_sendTransaction",
-                    params: [
-                      {
-                        from: userSession.address,
-                        to: CONTRACT_ADDRESS_TRADING,
-                        data: data,
-                        value: "0x0",
-                      },
-                    ],
-                  },
-                });
-
-                await bot.sendMessage(
-                  slMsg.chat.id,
-                  `Trade transaction submitted! Hash: ${result}\nWaiting for confirmation...`
-                );
-
-                const mockOrderId = Date.now().toString();
-                await storeTrade(slMsg.chat.id, mockOrderId, result);
-
-                await bot.sendMessage(slMsg.chat.id, "Trade order stored successfully! Use /opentrades to view your orders.");
-              } catch (error) {
-                console.error("Open trade error:", error.message);
-                await bot.sendMessage(slMsg.chat.id, `Failed to open trade. Error: ${error.message}`);
-              }
+              });
             });
-          });
+          } catch (balanceError) {
+            console.error("Balance/Allowance check error:", balanceError);
+            await bot.sendMessage(sizeMsg.chat.id, "Error checking wallet balance. Please try again.");
+          }
         });
       });
     });
   } catch (error) {
     console.error("Handle market trade error:", error);
-    await bot.sendMessage(msg.chat.id, "An error occurred. Please try again.");
+    await bot.sendMessage(msg.chat.id, "Failed to open Market trade. Please try again.");
+  }
+}
+
+// New function to handle trade execution with blockchain confirmation
+async function proceedWithTrade(bot, chatId, selectedPair, size, leverage, Price, buy, stopLoss, takeProfit) {
+  try {
+    const userSession = await getUserSession(chatId);
+
+    // Calculate adjusted stop-loss
+    const adjustedStopLoss = (calculateStopLoss(Price, stopLoss, leverage, buy)).toFixed(3);
+    
+    const tradeParams = {
+      trader: userSession.address,
+      pairIndex: PAIRS_OBJECT[selectedPair],
+      index: 0,
+      initialPosToken: 0,
+      positionSizeUSDC: ethers.parseUnits(size, 6),
+      openPrice: ethers.parseUnits(Price, 10),
+      buy: buy,
+      leverage: ethers.parseUnits(leverage, 10),
+      tp: takeProfit ? ethers.parseUnits(takeProfit.toString(), 10) : 0,
+      sl: stopLoss ? ethers.parseUnits(adjustedStopLoss.toString(), 10) : 0,
+      timestamp: Math.floor(Date.now() / 1000),
+    };
+
+    const type = 0; // Market order
+    const slippageP = ethers.parseUnits("1", 10); // 0.3%
+    const executionFee = 0;
+
+    // Encode the function call
+    const iface = new ethers.Interface(TRADING_ABI);
+    const data = iface.encodeFunctionData("openTrade", [
+      [
+        tradeParams.trader,
+        tradeParams.pairIndex,
+        tradeParams.index,
+        tradeParams.initialPosToken,
+        tradeParams.positionSizeUSDC,
+        tradeParams.openPrice,
+        tradeParams.buy,
+        tradeParams.leverage,
+        tradeParams.tp,
+        tradeParams.sl,
+        tradeParams.timestamp,
+      ],
+      type,
+      slippageP,
+      executionFee,
+    ]);
+
+    await bot.sendMessage(
+      chatId,
+      `Approve Trade in your wallet...`
+    );
+
+    // Send transaction request
+    const { result } = await makeWalletConnectRequest(`/request/${userSession.topic}`, "POST", {
+      chainId: `eip155:${BASE_CHAIN_ID}`,
+      request: {
+        method: "eth_sendTransaction",
+        params: [
+          {
+            from: userSession.address,
+            to: CONTRACT_ADDRESS_TRADING,
+            data: data,
+            value: "0x0",
+          },
+        ],
+      },
+    });
+
+    // Initial message about transaction submission
+    const initialMessage = await bot.sendMessage(
+      chatId,
+      `Trade transaction submitted! Hash: ${result}\nWaiting for blockchain confirmation...`
+    );
+
+    // Wait for blockchain confirmations
+    let confirmations = 0;
+    const maxWaitTime = 5 * 60 * 1000; // 5 minutes
+    const startTime = Date.now();
+
+    const checkConfirmations = async () => {
+      try {
+        const receipt = await Provider.getTransactionReceipt(result);
+        
+        if (receipt) {
+          confirmations = receipt.confirmations || 0;
+          
+          if (confirmations >= 2) {
+            // Update message to confirmed
+            await bot.editMessageText(
+              `Trade confirmed on blockchain! ✅\n` +
+              `Transaction Hash: ${result}\n` +
+              `Confirmations: ${confirmations}\n` +
+              `Check your open trades using /opentrades`,
+              {
+                chat_id: chatId,
+                message_id: initialMessage.message_id
+              }
+            );
+
+            // Store trade
+            const mockOrderId = Date.now().toString();
+            await storeTrade(chatId, mockOrderId, result);
+
+            return true;
+          }
+        }
+
+        // If not enough confirmations and not timed out, check again
+        if (Date.now() - startTime < maxWaitTime) {
+          setTimeout(checkConfirmations, 15000); // Check every 15 seconds
+        } else {
+          // Timeout occurred
+          await bot.editMessageText(
+            `Trade submission timed out. Please check transaction status manually.\n` +
+            `Transaction Hash: ${result}`,
+            {
+              chat_id: chatId,
+              message_id: initialMessage.message_id
+            }
+          );
+        }
+      } catch (error) {
+        console.error("Confirmation check error:", error);
+        await bot.editMessageText(
+          `Error checking transaction confirmation.\n` +
+          `Transaction Hash: ${result}`,
+          {
+            chat_id: chatId,
+            message_id: initialMessage.message_id
+          }
+        );
+      }
+    };
+
+    // Start confirmation checking
+    await checkConfirmations();
+
+  } catch (error) {
+    console.error("Open trade error:", error.message);
+    await bot.sendMessage(chatId, `Failed to open trade. Error: ${error}`);
   }
 }
 
@@ -897,7 +1246,7 @@ async function handleGetTrades(bot, msg, contractInstance) {
   // Fetch user session from your database
   const userSession = await getUserSession(chatId);
   if (!userSession || !userSession.address) {
-    await bot.sendMessage(chatId, "Please connect your wallet first using /connect");
+    await bot.sendMessage(chatId, "Please connect your wallet first using /connect , Make sure wallet supports Base chain");
     return;
   }
 
