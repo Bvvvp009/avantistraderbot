@@ -14,8 +14,7 @@ const getTrades = require('./trades/getTrades');
 const TRADING_ABI = require('./constants/abis/tradingabi.json');
 const ALL_PAIRS = require('./constants/feed_pairs_contracts/pairs.json');
 const pairs_with_index_number = require('./constants/pairs/pairsinformation.json');
-const {calculateStopLoss,profit_loss} = require('./trades/sl_tp');
-const prices = require('./price/prices.json');
+const {calculateStopLoss} = require('./trades/sl_tp');
 dotenv.config();
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -24,7 +23,7 @@ const BASE_RPC = process.env.BASE_RPC
 const CONTRACT_ADDRESS_TRADING = '0x5FF292d70bA9cD9e7CCb313782811b3D7120535f';
 const BASE_CHAIN_ID = 8453;
 const USDC_CONTRACT_ON_BASE = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
-const SPENDER_APPROVE = "0x8a311d7048c35985aa31c131b9a13e03a5f7422d"
+const SPENDER_APPROVE = "0x8a311D7048c35985aa31C131B9A13e03a5f7422d"
 
 const USDC_ABI = JSON.parse(fs.readFileSync('./constants/abis/erc20abi.json'));
 const MULTICALL_ABI = JSON.parse(fs.readFileSync('./constants/abis/multicall.json'));
@@ -106,24 +105,29 @@ async function initBot() {
     bot.onText(/\/verify/, (msg) => handleVerifyConnection(bot, msg));
     bot.onText(/\/opentrades/, (msg) => handleGetTrades(bot, msg, CONTRACT_INSTANCE_MULTICALL));
     bot.onText(/\/disconnect/, (msg) => handleDisconnect(bot, msg));
-    bot.onText(/\/approve(?: (\d+(\.\d+)?))?/, async (msg, match) => {
-      const chatId = msg.chat.id;
-      const amount = match[1]; // Extract amount if provided
-      
-      if (!amount) {
-        await bot.sendMessage(chatId, "❌ Please specify the amount. For example, `/approve 100`", { parse_mode: "Markdown" });
-        return;
-      }
-    
-      try {
-        await handleApprove(bot, msg, parseFloat(amount));
-        await bot.sendMessage(chatId, `✅ Approved ${amount} USDC for spending.`);
-      } catch (error) {
-        console.error("Error during approval:", error);
-        await bot.sendMessage(chatId, "❌ Failed to process approval. Please try again.");
-      }
-    });
+   // Handle the initial /approve command
+bot.onText(/^\/approve$/, async (msg) => {
+  const chatId = msg.chat.id;
+  await bot.sendMessage(
+    chatId,
+    "💰 Please enter the amount you want to approve.\nFormat: `/approve amount`",
+    { parse_mode: "Markdown" }
+  );
+});
 
+// Handle the /approve command with amount
+bot.onText(/^\/approve\s+(\d+(?:\.\d+)?)$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const amount = match[1];
+
+  try {
+    await handleApprove(bot, msg);
+    await bot.sendMessage(chatId, `✅ Approved ${amount} USDC for spending.`);
+  } catch (error) {
+    console.error("Error during approval:", error);
+    await bot.sendMessage(chatId, "❌ Failed to process approval. Please try again.");
+  }
+});
   
     await bot.setMyCommands([
       { command: '/start', description: 'Start the bot' },
@@ -271,31 +275,6 @@ async function initBot() {
               icon: '🛡',
             },
             {
-              name: 'SafePal',
-              redirectScheme: 'safe',
-              icon: '🔐',
-            },
-            {
-              name: 'OKX',
-              redirectScheme: 'okx',
-              icon: '⭕️',
-            },
-            {
-              name: 'Zerion',
-              redirectScheme: 'zerion',
-              icon: '🌐',
-            },
-            {
-              name: 'TokenPocket',
-              redirectScheme: 'tp',
-              icon: '💼',
-            },
-            {
-              name: 'Rainbow',
-              redirectScheme: 'rainbow',
-              icon: '🌈',
-            },
-            {
               name: 'Other wallets',
               redirectScheme: 'safe',
               icon: '👜',
@@ -340,9 +319,9 @@ async function initBot() {
           
           const statusMessage = await bot.sendMessage(
             msg.chat.id,
-            `Please select a wallet to connect.  
-          This session will remain active for only 1 minute.  
-          If the session expires, you can restart it anytime use /connect command.`
+          `Please select a wallet to connect.\n` +
+          `This session will remain active for only 1 minute.\n`+  
+          `If this session expire, you can restart it anytime use /connect command.`
           );
           
 
@@ -422,41 +401,37 @@ async function initBot() {
     }
   }
 
-  async function handleApprove(bot, msg) {
+  async function handleApprove(bot, msg, tradeState = null) {
     const [, amount] = msg.text.split(' ');
   
     if (!amount) {
       await bot.sendMessage(msg.chat.id, 'Please provide amount to spend: /approve <amount>');
-      return;
+      return false;
     }
   
     try {
       const userSession = await getUserSession(msg.chat.id);
       if (!userSession || !userSession.topic || !userSession.address) {
         await bot.sendMessage(msg.chat.id, 'Please connect your wallet first using /connect');
-        return;
+        return false;
       }
   
-      // Check current allowance
       const currentAllowance = await CONTRACT_INSTANCE_USDC.allowance(userSession.address, SPENDER_APPROVE);
       console.log(`Current Allowance: ${ethers.formatUnits(currentAllowance, 6)} USDC`);
   
-      // Verify wallet session
       try {
         await makeWalletConnectRequest(`/session/${userSession.topic}`, 'GET');
       } catch (error) {
         await bot.sendMessage(msg.chat.id, 'Your wallet session has expired. Please reconnect using /connect');
-        return;
+        return false;
       }
   
-      // Validate input amount
       const parseAmount = parseFloat(amount);
       if (isNaN(parseAmount) || parseAmount <= 0) {
         await bot.sendMessage(msg.chat.id, 'Invalid amount. Please enter a positive number.');
-        return;
+        return false;
       }
   
-      // Check user's USDC balance
       const userBalance = await CONTRACT_INSTANCE_USDC.balanceOf(userSession.address);
       const requestedAllowance = ethers.parseUnits(amount.toString(), 6);
 
@@ -467,30 +442,26 @@ async function initBot() {
           `Requested Allowance: ${amount} USDC\n` +
           `Current Allowance: ${ethers.formatUnits(currentAllowance, 6)} USDC`
         );
-        return; // This ensures NO further code execution
+        return false;
       }
   
-      // Prepare approve parameters
       const approveParams = {
         spender: SPENDER_APPROVE,
         allowance: requestedAllowance
       };
       
-      // Encode approve function call
       const iface = new ethers.Interface(USDC_ABI);
       const data = iface.encodeFunctionData("approve", [
         approveParams.spender,
         approveParams.allowance
       ]);
   
-      // Send initial confirmation message
       const initialMessage = await bot.sendMessage(msg.chat.id, 
         `Requesting approval for ${amount} USDC\n` +
         `Spender: ${SPENDER_APPROVE}\n` +
         'Please check your wallet for approval...'
       );
   
-      // Send transaction request
       const { result } = await makeWalletConnectRequest(`/request/${userSession.topic}`, 'POST', {
         chainId: `eip155:${BASE_CHAIN_ID}`,
         request: {
@@ -504,97 +475,76 @@ async function initBot() {
         },
       });
   
-      // Wait for blockchain confirmations
-      let confirmations = 0;
-      const maxWaitTime = 5 * 60 * 1000; // 5 minutes
+      const maxWaitTime = 2 * 60 * 1000;
       const startTime = Date.now();
   
-      const checkConfirmations = async () => {
-        try {
-          // Get transaction receipt
-          const receipt = await Provider.getTransactionReceipt(result);
-      
-          if (receipt) {
-            console.log('Transaction Receipt:', receipt);
-            
-            // Check transaction status
-            console.log('Transaction Status:', receipt.status);
-            
-            // Explicitly check confirmations
-            const currentBlock = await Provider.getBlockNumber();
-            const confirmations = currentBlock - receipt.blockNumber;
-      
-            console.log(`Current Block: ${currentBlock}`);
-            console.log(`Transaction Block: ${receipt.blockNumber}`);
-            console.log(`Confirmations: ${confirmations}`);
-      
-            // Modify confirmation check logic
-            if (confirmations >= 1) {
-              console.log(`✅ Transaction confirmed with ${confirmations} confirmations.`);
-      
-              // Verify new allowance after confirmation
-              const newAllowance = await CONTRACT_INSTANCE_USDC.allowance(userSession.address, SPENDER_APPROVE);
-      
-              // Update message to confirmed
+      return new Promise((resolve) => {
+        const checkConfirmations = async () => {
+          try {
+            const receipt = await Provider.getTransactionReceipt(result);
+        
+            if (receipt) {
+              const currentBlock = await Provider.getBlockNumber();
+              const confirmations = currentBlock - receipt.blockNumber;
+        
+              if (confirmations >= 3) {
+                const newAllowance = await CONTRACT_INSTANCE_USDC.allowance(userSession.address, SPENDER_APPROVE);
+        
+                await bot.editMessageText(
+                  `Approval Confirmed! ✅\n` +
+                  `Transaction Hash: ${result}\n` +
+                  `Confirmations: ${confirmations}\n` +
+                  `New Allowance: ${ethers.formatUnits(newAllowance, 6)} USDC`,
+                  {
+                    chat_id: msg.chat.id,
+                    message_id: initialMessage.message_id
+                  }
+                );
+
+                // If we have tradeState, continue with the trade
+
+                console.log(tradeState)
+                if (tradeState) {
+                  await bot.sendMessage(msg.chat.id, 
+                    `Approval successful! Continuing with your ${tradeState.buy ? "Long 🟢" : "Short 🔴"} position...\n` +
+                    `Please enter leverage (Max: ${tradeState.maxLeverage}x):`
+                  );
+                }
+        
+                resolve(true);
+                return;
+              }
+            }
+        
+            if (Date.now() - startTime < maxWaitTime) { 
+              setTimeout(checkConfirmations, 5000);
+            } else {
               await bot.editMessageText(
-                `Approval Confirmed! ✅\n` +
-                `Transaction Hash: ${result}\n` +
-                `Confirmations: ${confirmations}\n` +
-                `New Allowance: ${ethers.formatUnits(newAllowance, 6)} USDC`,
+                `Approval transaction timed out. Please try again.\n` +
+                `Transaction Hash: ${result}`,
                 {
                   chat_id: msg.chat.id,
                   message_id: initialMessage.message_id
                 }
               );
-      
-              return true;
-            } else {
-              console.log('⏳ Transaction is pending confirmation.');
+              resolve(false);
             }
-          } else {
-            console.error('❌ Transaction receipt not found. It might still be pending.');
+          } catch (error) {
+            console.error("Confirmation check error:", error);
+            resolve(false);
           }
-      
-          // If not enough confirmations and not timed out, check again
-          if (Date.now() - startTime < maxWaitTime) {
-            setTimeout(checkConfirmations, 5000); // Check every 5 seconds
-          } else {
-            // Timeout occurred
-            await bot.editMessageText(
-              `Approval transaction timed out. Please check transaction status manually.\n` +
-              `Transaction Hash: ${result}`,
-              {
-                chat_id: msg.chat.id,
-                message_id: initialMessage.message_id
-              }
-            );
-          }
-        } catch (error) {
-          console.error("Confirmation check error:", error);
-          await bot.editMessageText(
-            `Error checking transaction confirmation.\n` +
-            `Transaction Hash: ${result}`,
-            {
-              chat_id: msg.chat.id,
-              message_id: initialMessage.message_id
-            }
-          );
-        }
-      };
-      // Start confirmation checking
-      await checkConfirmations();
+        };
+        
+        checkConfirmations();
+      });
   
     } catch (error) {
       console.error("Approve transaction error:", error);
-      
-      let errorMessage = 'Failed to process approval.';
-      if (error.message) {
-        errorMessage += ` Error: ${error.message}`;
-      }
-  
-      await bot.sendMessage(msg.chat.id, errorMessage);
+      await bot.sendMessage(msg.chat.id, `Failed to process approval. Error: ${error.message || ''}`);
+      return false;
     }
-  }
+}
+
 
 // handleLimitTrade function
 async function handleLimitTrade(bot, msg) {
@@ -606,10 +556,19 @@ async function handleLimitTrade(bot, msg) {
       return;
     }
 
-    // Step 1: Show trading pairs menu
+    let tradeState = {
+      selectedPair: null,
+      size: null,
+      leverage: null,
+      buy: null,
+      price: null,
+      limitPrice: null,
+      stopLoss: null,
+      takeProfit: null
+    };
+
     showPairsMenu(bot, msg.chat.id, "limit");
 
-    // Step 2: Handle pair selection via callback
     bot.once("callback_query", async (callbackQuery) => {
       const { data, message } = callbackQuery;
       const [action, type, selectedPair] = data.split(":");
@@ -619,10 +578,10 @@ async function handleLimitTrade(bot, msg) {
         return;
       }
 
-      const Price = await price({ id: [feedIds[selectedPair].id] });
+      tradeState.selectedPair = selectedPair;
+      tradeState.price = await price({ id: [feedIds[selectedPair].id] });
       const maxLeverage = feedIds[selectedPair].leverage || "NaN";
 
-      // Ask for Long or Short
       const options = {
         reply_markup: JSON.stringify({
           inline_keyboard: [
@@ -634,32 +593,28 @@ async function handleLimitTrade(bot, msg) {
 
       await bot.sendMessage(message.chat.id, "Do you want to go Long🟢 or Short🔴?", options);
 
-      // Step 3: Handle Long/Short selection
       bot.once("callback_query", async (directionCallback) => {
         const directionData = directionCallback.data.split(":");
-        const direction = directionData[1]; // "long" or "short"
-        const buy = direction === "long"; // Long => true, Short => false
+        const direction = directionData[1];
+        tradeState.buy = direction === "long";
 
-        await bot.sendMessage(message.chat.id, `You selected ${buy ? "Long 🟢" : "Short 🔴"}. Enter the size in USDC:`);
+        await bot.sendMessage(directionCallback.message.chat.id, `You selected ${tradeState.buy ? "Long 🟢" : "Short 🔴"}. Enter the size in USDC:`);
 
-        // Step 4: Wait for size input
         bot.once("message", async (sizeMsg) => {
           const size = sizeMsg.text;
 
-          // Validate size input
           if (isNaN(size) || parseFloat(size) <= 0) {
             await bot.sendMessage(sizeMsg.chat.id, "Invalid size. Please enter a valid number.");
             return;
           }
 
-          // Check wallet balance and allowance
           try {
             const check_balance = await CONTRACT_INSTANCE_USDC.balanceOf(userSession.address);
             const check_allowance = await CONTRACT_INSTANCE_USDC.allowance(userSession.address, SPENDER_APPROVE);
-            
             const requiredAmount = ethers.parseUnits(size.toString(), 6);
             
-            // Check balance
+            tradeState.size = parseFloat(size);
+
             if (check_balance < requiredAmount) {
               await bot.sendMessage(sizeMsg.chat.id, 
                 `Insufficient balance!\n` +
@@ -669,112 +624,187 @@ async function handleLimitTrade(bot, msg) {
               return;
             }
 
-            // Check allowance
             if (check_allowance < requiredAmount) {
+              const neededApproval = ethers.formatUnits(requiredAmount - check_allowance, 6);
+              
+              const approveOptions = {
+                reply_markup: JSON.stringify({
+                  inline_keyboard: [
+                    [{ text: "📝 Approve USDC", callback_data: `approve:${neededApproval}` }],
+                    [{ text: "❌ Cancel", callback_data: "approve:cancel" }],
+                  ],
+                }),
+              };
+
               await bot.sendMessage(sizeMsg.chat.id, 
-                `Insufficient allowance!\n` +
+                `⚠️ Insufficient Approval!\n\n` +
                 `Current Allowance: ${ethers.formatUnits(check_allowance, 6)} USDC\n` +
-                `Required Allowance: ${size} USDC\n` +
-                `Please use /approve <amount> command to increase allowance.`
+                `Required Amount: ${size} USDC\n` +
+                `Additional Needed: ${neededApproval} USDC`, 
+                approveOptions
               );
-              return;
-            }
 
-            await bot.sendMessage(sizeMsg.chat.id, `Size: ${size} USDC. Now enter leverage:\nMax leverage for this pair is ${maxLeverage}x`);
+              bot.once("callback_query", async (approveCallback) => {
+                const [action, value] = approveCallback.data.split(":");
+                
+                if (action === "approve" && value !== "cancel") {
+                  const approveMsg = {
+                    chat: { id: sizeMsg.chat.id },
+                    text: `/approve ${value}`
+                  };
 
-            // Step 5: Wait for leverage input
-            bot.once("message", async (leverageMsg) => {
-              const leverage = leverageMsg.text;
+                  const approvalSuccess = await handleApprove(bot, approveMsg);
+                  
+                  if (!approvalSuccess) {
+                    await bot.sendMessage(sizeMsg.chat.id, "Approval failed or was rejected. Please try again /openlimit");
+                    return;
+                  }
 
-              if (isNaN(leverage) || parseFloat(leverage) <= 0 || parseFloat(leverage) > maxLeverage) {
-                await bot.sendMessage(leverageMsg.chat.id, `Invalid leverage. Please enter a valid number between 1 and ${maxLeverage}x`);
-                return;
-              }
-
-              let text;
-              if(buy){
-                text = `Below ${Price} $.`
-              } else {
-                text = `Above ${Price} $.`
-              }
-
-              await bot.sendMessage(leverageMsg.chat.id, `Leverage: ${leverage}x \n Present Trading price of selected pair: ${parseFloat(Price).toFixed(2)}$\n Enter the Limit Price ${text}:`);
-
-              // Step 6: Wait for limit price input
-              bot.once("message", async (priceMsg) => {
-                const limitPrice = priceMsg.text;
-
-                if (isNaN(limitPrice) || parseFloat(limitPrice) <= 0) {
-                  await bot.sendMessage(priceMsg.chat.id, "Invalid limit price. Please enter a valid number.");
+                  await continueLimitTradeFlow(bot, sizeMsg.chat.id, tradeState, maxLeverage);
+                } else {
+                  await bot.sendMessage(sizeMsg.chat.id, "Trade cancelled. Use /openlimit to start again.");
                   return;
                 }
-
-                // Prompt for Stop-Loss and Take-Profit
-                const slTpOptions = {
-                  reply_markup: JSON.stringify({
-                    inline_keyboard: [
-                      [
-                        { text: "Yes, I want to set Stop-Loss/Take-Profit", callback_data: "sl_tp:yes" },
-                        { text: "No, use default (0)", callback_data: "sl_tp:no" }
-                      ]
-                    ]
-                  })
-                };
-
-                await bot.sendMessage(priceMsg.chat.id, "Do you want to set Stop-Loss and Take-Profit?", slTpOptions);
-
-                // Step 7: Handle Stop-Loss and Take-Profit selection
-                bot.once("callback_query", async (slTpCallback) => {
-                  const [action, choice] = slTpCallback.data.split(":");
-                  const chatId = slTpCallback.message.chat.id;
-
-                  if (choice === "no") {
-                    // Proceed with default 0 for stop-loss and take-profit
-                    await proceedWithLimitTrade(bot, chatId, selectedPair, size, leverage, limitPrice, Price, buy, 0, 0);
-                  } else {
-                    // Prompt for Stop-Loss
-                    await bot.sendMessage(chatId, `Enter stop-loss price:`);
-
-                    bot.once("message", async (slMsg) => {
-                      const stopLoss = slMsg.text;
-
-                      if (isNaN(stopLoss) || parseFloat(stopLoss) <= 0) {
-                        await bot.sendMessage(slMsg.chat.id, "Invalid stop-loss. Please enter a valid number.");
-                        return;
-                      }
-
-                      // Prompt for Take-Profit
-                      await bot.sendMessage(slMsg.chat.id, "Enter take-profit price (or 0 to skip):");
-
-                      bot.once("message", async (tpMsg) => {
-                        const takeProfit = tpMsg.text;
-
-                        if (isNaN(takeProfit) || parseFloat(takeProfit) < 0) {
-                          await bot.sendMessage(tpMsg.chat.id, "Invalid take-profit. Please enter a valid price or 0.");
-                          return;
-                        }
-
-                        // Proceed with trade
-                        await proceedWithLimitTrade(bot, tpMsg.chat.id, selectedPair, size, leverage, limitPrice, Price, buy, stopLoss, takeProfit);
-                      });
-                    });
-                  }
-                });
               });
-            });
-          } catch (balanceError) {
-            console.error("Balance/Allowance check error:", balanceError);
-            await bot.sendMessage(sizeMsg.chat.id, "Error checking wallet balance. Please try again.");
+            } else {
+              await continueLimitTradeFlow(bot, sizeMsg.chat.id, tradeState, maxLeverage);
+            }
+          } catch (error) {
+            console.error("Trade processing error:", error);
+            await bot.sendMessage(sizeMsg.chat.id, "Error processing trade. Please try again.");
           }
         });
       });
     });
   } catch (error) {
     console.error("Handle limit trade error:", error);
-    await bot.sendMessage(msg.chat.id, "Failed to open limit trade, Please try agian. ");
+    await bot.sendMessage(msg.chat.id, "Failed to open limit trade. Please try again.");
   }
 }
 
+async function continueLimitTradeFlow(bot, chatId, tradeState, maxLeverage) {
+  await bot.sendMessage(chatId, 
+    `Size: ${tradeState.size} USDC. Now enter leverage:\nMax leverage for this pair is ${maxLeverage}x`
+  );
+
+  bot.once("message", async (leverageMsg) => {
+    const leverage = leverageMsg.text;
+    
+    if (isNaN(leverage) || parseFloat(leverage) <= 0 || parseFloat(leverage) > maxLeverage) {
+      await bot.sendMessage(leverageMsg.chat.id, `Invalid leverage. Please enter a valid number between 1 and ${maxLeverage}x`);
+      return;
+    }
+
+    tradeState.leverage = parseFloat(leverage);
+
+    let text;
+    if(tradeState.buy) {
+      text = `Below ${tradeState.price>1?parseFloat(tradeState.price).toFixed(2):parseFloat(tradeState.price).toFixed(4)} $.`;
+    } else {
+      text = `Above ${tradeState.price>1?parseFloat(tradeState.price).toFixed(2):parseFloat(tradeState.price).toFixed(4)} $.`;
+    }
+
+    await bot.sendMessage(leverageMsg.chat.id, 
+      `**Leverage: ${leverage}x**\n` +
+      `Present Trading price of selected pair: ${parseFloat(tradeState.price).toFixed(2)}$\n` +
+      `Enter the Limit Price ${text}`
+    );
+
+    bot.once("message", async (limitPriceMsg) => {
+      const limitPrice = limitPriceMsg.text;
+
+      if (isNaN(limitPrice) || parseFloat(limitPrice) <= 0) {
+        await bot.sendMessage(limitPriceMsg.chat.id, "Invalid limit price. Please enter a valid number.");
+        return;
+      }
+
+      tradeState.limitPrice = parseFloat(limitPrice);
+
+      const slTpOptions = {
+        reply_markup: JSON.stringify({
+          inline_keyboard: [
+            [{ text: "Yes", callback_data: "set_sl_tp:yes" }],
+            [{ text: "No", callback_data: "set_sl_tp:no" }],
+          ],
+        }),
+      };
+
+      await bot.sendMessage(limitPriceMsg.chat.id, "Would you like to set Stop Loss and Take Profit?", slTpOptions);
+
+      bot.once("callback_query", async (slTpCallback) => {
+        const [action, value] = slTpCallback.data.split(":");
+        
+        if (value === "yes") {
+          await bot.sendMessage(slTpCallback.message.chat.id, `Enter Stop Loss price (or 'skip' to skip):\n`+
+          `Set Stoploss ${tradeState.buy?`Below`:`Above`}, Your Limit Price ${tradeState.limitPrice>1?`${parseFloat(tradeState.limitPrice).toFixed(2)}`:`${parseFloat(tradeState.limitPrice).toFixed(2)}$`}\n`
+
+          );
+          
+          bot.once("message", async (slMsg) => {
+            if (slMsg.text.toLowerCase() === 'skip') {
+              tradeState.stopLoss = 0;
+            } else {
+              const stopLoss = parseFloat(slMsg.text);
+              if (isNaN(stopLoss) || stopLoss <= 0) {
+                await bot.sendMessage(slMsg.chat.id, "Invalid Stop Loss. Please try again /openlimit");
+                return;
+              }
+              tradeState.stopLoss = stopLoss;
+            }
+
+            await bot.sendMessage(slMsg.chat.id, `Enter Take Profit price (or 'skip' to skip):\n`+
+              `Set Take Profit ${tradeState.buy?`Above`:`Below`} Limit Price ${tradeState.limitPrice>1?`${parseFloat(tradeState.limitPrice).toFixed(2)}`:`${parseFloat(tradeState.limitPrice).toFixed(2)}$`}\n`
+
+            );
+            
+            bot.once("message", async (tpMsg) => {
+              if (tpMsg.text.toLowerCase() === 'skip') {
+                tradeState.takeProfit = 0;
+              } else {
+                const takeProfit = parseFloat(tpMsg.text);
+                if (isNaN(takeProfit) || takeProfit <= 0) {
+                  await bot.sendMessage(tpMsg.chat.id, "Invalid Take Profit. Please try again /openlimit");
+                  return;
+                }
+                tradeState.takeProfit = takeProfit;
+              }
+
+              await bot.sendMessage(tpMsg.chat.id, "Please check your wallet for trade confirmation...");
+              await proceedWithLimitTrade(
+                bot,
+                tpMsg.chat.id,
+                tradeState.selectedPair,
+                tradeState.size,
+                tradeState.leverage,
+                tradeState.limitPrice,
+                tradeState.price,
+                tradeState.buy,
+                tradeState.stopLoss || 0,
+                tradeState.takeProfit || 0
+              );
+            });
+          });
+        } else {
+          tradeState.stopLoss = 0;
+          tradeState.takeProfit = 0;
+          await bot.sendMessage(slTpCallback.message.chat.id, "Please check your wallet for trade confirmation...");
+          await proceedWithLimitTrade(
+            bot,
+            slTpCallback.message.chat.id,
+            tradeState.selectedPair,
+            tradeState.size,
+            tradeState.leverage,
+            tradeState.limitPrice,
+            tradeState.price,
+            tradeState.buy,
+            0,
+            0
+          );
+        }
+      });
+    });
+  });
+}
 // New function to handle limit trade execution with blockchain confirmation
 async function proceedWithLimitTrade(bot, chatId, selectedPair, size, leverage, limitPrice, currentPrice, buy, stopLoss, takeProfit) {
   try {
@@ -789,10 +819,10 @@ async function proceedWithLimitTrade(bot, chatId, selectedPair, size, leverage, 
       pairIndex: PAIRS_OBJECT[selectedPair],
       index: 0,
       initialPosToken: 0,
-      positionSizeUSDC: ethers.parseUnits(size, 6),
-      openPrice: ethers.parseUnits(limitPrice, 10),
+      positionSizeUSDC: ethers.parseUnits(size.toString(), 6),
+      openPrice: ethers.parseUnits(limitPrice.toString(), 10),
       buy: buy,
-      leverage: ethers.parseUnits(leverage, 10),
+      leverage: ethers.parseUnits(leverage.toString(), 10),
       tp: takeProfit ? ethers.parseUnits(takeProfit.toString(), 10) : 0,
       sl: stopLoss ? ethers.parseUnits(adjustedStopLoss.toString(), 10) : 0,
       timestamp: Math.floor(Date.now() / 1000),
@@ -839,74 +869,60 @@ async function proceedWithLimitTrade(bot, chatId, selectedPair, size, leverage, 
       },
     });
 
-    // Initial message about transaction submission
-    const initialMessage = await bot.sendMessage(
-      chatId,
-      `Limit trade transaction submitted! Hash: ${result}\nWaiting for blockchain confirmation...`
-    );
+   // Initial message about transaction submission
+const initialMessage = await bot.sendMessage(
+  chatId,  // Make sure chatId is defined and correct
+  `Limit trade transaction submitted! Hash: ${result}\n`+
+  `Waiting for blockchain confirmation...`
+);
 
-    // Wait for blockchain confirmations
-    let confirmations = 0;
-    const maxWaitTime = 5 * 60 * 1000; // 5 minutes
-    const startTime = Date.now();
+// Wait for blockchain confirmations
+const startTime = Date.now();
+const maxWaitTime = 2 * 60 * 1000;
 
-    const checkConfirmations = async () => {
-      try {
-        const receipt = await provider.getTransactionReceipt(result);
-        
-        if (receipt) {
-          confirmations = receipt.confirmations || 0;
-          
-          if (confirmations >= 2) {
-            // Update message to confirmed
-            await bot.editMessageText(
-              `Limit Trade confirmed on blockchain! ✅\n` +
-              `Transaction Hash: ${result}\n` +
-              `Confirmations: ${confirmations}\n` +
-              `Check your open trades using /opentrades`,
-              {
-                chat_id: chatId,
-                message_id: initialMessage.message_id
-              }
-            );
+const checkConfirmations = async () => {
+  try {
+    const receipt = await Provider.getTransactionReceipt(result);
+    
+    if (receipt) {
+      const currentBlock = await Provider.getBlockNumber();
+      const confirmations = currentBlock - receipt.blockNumber;
 
-            // Store trade
-            const mockOrderId = Date.now().toString();
-            await storeTrade(chatId, mockOrderId, result);
+      console.log(currentBlock, confirmations)
 
-            return true;
-          }
-        }
-
-        // If not enough confirmations and not timed out, check again
-        if (Date.now() - startTime < maxWaitTime) {
-          setTimeout(checkConfirmations, 15000); // Check every 15 seconds
-        } else {
-          // Timeout occurred
-          await bot.editMessageText(
-            `Limit trade submission timed out. Please check transaction status manually.\n` +
-            `Transaction Hash: ${result}`,
-            {
-              chat_id: chatId,
-              message_id: initialMessage.message_id
-            }
-          );
-        }
-      } catch (error) {
-        console.error("Confirmation check error:", error);
+      if (confirmations >= 3) {
         await bot.editMessageText(
-          `Error checking transaction confirmation.\n` +
-          `Transaction Hash: ${result}`,
+          `Limit Order Confirmed! ✅\n` +
+          `Transaction Hash: ${result}\n` +
+          `Confirmations: ${confirmations}\n` +
+          `Check your trades using /opentrades.`,
           {
-            chat_id: chatId,
+            chat_id: initialMessage.chat.id,
             message_id: initialMessage.message_id
           }
         );
+        return; // Exit the function after successful confirmation
       }
-    };
+    }
 
-    // Start confirmation checking
-    await checkConfirmations();
+    if (Date.now() - startTime < maxWaitTime) { 
+      setTimeout(checkConfirmations, 5000);
+    } else {
+      await bot.editMessageText(
+        `Limit Order transaction timed out. Please try again.\n` +
+        `Transaction Hash: ${result}`,
+        {
+          chat_id: initialMessage.chat.id,
+          message_id: initialMessage.message_id
+        }
+      );
+    }
+  } catch (error) {
+    console.error("Confirmation check error:", error);
+  }
+};
+
+await checkConfirmations();
 
   } catch (error) {
     console.error("Open limit trade error:", error.message);
@@ -924,10 +940,18 @@ async function handleMarketTrade(bot, msg) {
       return;
     }
 
-    // Step 1: Show trading pairs menu
+    let tradeState = {
+      selectedPair: null,
+      size: null,
+      leverage: null,
+      buy: null,
+      price: null,
+      stopLoss: null,
+      takeProfit: null
+    };
+
     showPairsMenu(bot, msg.chat.id, "market");
 
-    // Step 2: Handle pair selection via callback
     bot.once("callback_query", async (callbackQuery) => {
       const { data, message } = callbackQuery;
       const [action, type, selectedPair] = data.split(":");
@@ -937,10 +961,10 @@ async function handleMarketTrade(bot, msg) {
         return;
       }
 
-      const Price = await price({ id: [feedIds[selectedPair].id] });
+      tradeState.selectedPair = selectedPair;
+      tradeState.price = await price({ id: [feedIds[selectedPair].id] });
       const maxLeverage = feedIds[selectedPair].leverage || "NaN";
 
-      // Ask for Long or Short
       const options = {
         reply_markup: JSON.stringify({
           inline_keyboard: [
@@ -952,32 +976,28 @@ async function handleMarketTrade(bot, msg) {
 
       await bot.sendMessage(message.chat.id, "Do you want to go Long🟢 or Short🔴?", options);
 
-      // Step 3: Handle Long/Short selection
       bot.once("callback_query", async (directionCallback) => {
         const directionData = directionCallback.data.split(":");
-        const direction = directionData[1]; // "long" or "short"
-        const buy = direction === "long"; // Long => true, Short => false
+        const direction = directionData[1];
+        tradeState.buy = direction === "long";
 
-        await bot.sendMessage(message.chat.id, `You selected ${buy ? "Long 🟢" : "Short 🔴"}. Enter the size in USDC:`);
+        await bot.sendMessage(directionCallback.message.chat.id, `You selected ${tradeState.buy ? "Long 🟢" : "Short 🔴"}. Enter the size in USDC:`);
 
-        // Step 4: Wait for size input
         bot.once("message", async (sizeMsg) => {
           const size = sizeMsg.text;
 
-          // Validate size input
           if (isNaN(size) || parseFloat(size) <= 0) {
             await bot.sendMessage(sizeMsg.chat.id, "Invalid size. Please enter a valid number.");
             return;
           }
 
-          // Check wallet balance and allowance
           try {
             const check_balance = await CONTRACT_INSTANCE_USDC.balanceOf(userSession.address);
             const check_allowance = await CONTRACT_INSTANCE_USDC.allowance(userSession.address, SPENDER_APPROVE);
-            
             const requiredAmount = ethers.parseUnits(size.toString(), 6);
             
-            // Check balance
+            tradeState.size = parseFloat(size);
+
             if (check_balance < requiredAmount) {
               await bot.sendMessage(sizeMsg.chat.id, 
                 `Insufficient balance!\n` +
@@ -987,90 +1007,242 @@ async function handleMarketTrade(bot, msg) {
               return;
             }
 
-            // Check allowance
             if (check_allowance < requiredAmount) {
-              await bot.sendMessage(sizeMsg.chat.id, 
-                `Insufficient allowance!\n` +
-                `Current Allowance: ${ethers.formatUnits(check_allowance, 6)} USDC\n` +
-                `Required Allowance: ${size} USDC\n` +
-                `Please use /approve <amount> command to increase allowance.`
-              );
-              return;
-            }
-
-            await bot.sendMessage(sizeMsg.chat.id, `Size: ${size} USDC. Now enter leverage:\nMax leverage for this pair is ${maxLeverage}x`);
-
-            // Step 5: Wait for leverage input
-            bot.once("message", async (leverageMsg) => {
-              const leverage = leverageMsg.text;
-             
-              if (isNaN(leverage) || parseFloat(leverage) <= 0 || parseFloat(leverage) > maxLeverage) {
-                await bot.sendMessage(leverageMsg.chat.id, `Invalid leverage. Please enter a valid number between 1 and ${maxLeverage}x`);
-                return;
-              }
-
-              // Prompt for Stop-Loss and Take-Profit
-              const slTpOptions = {
+              const neededApproval = ethers.formatUnits(requiredAmount, 6);
+              
+              const approveOptions = {
                 reply_markup: JSON.stringify({
                   inline_keyboard: [
-                    [
-                      { text: "Yes, I want to set Stop-Loss/Take-Profit", callback_data: "sl_tp:yes" },
-                      { text: "No, use default (0)", callback_data: "sl_tp:no" }
-                    ]
-                  ]
-                })
+                    [{ text: "📝 Approve USDC", callback_data: `approve:${neededApproval}` }],
+                    [{ text: "❌ Cancel", callback_data: "approve:cancel" }],
+                  ],
+                }),
               };
 
-              await bot.sendMessage(leverageMsg.chat.id, "Do you want to set Stop-Loss and Take-Profit?", slTpOptions);
+              await bot.sendMessage(sizeMsg.chat.id, 
+                `⚠️ Insufficient Approval!\n\n` +
+                `Current Allowance: ${ethers.formatUnits(check_allowance, 6)} USDC\n` +
+                `Required Amount: ${size} USDC\n` +
+                `Additional Needed: ${neededApproval} USDC`, 
+                approveOptions
+              );
 
-              // Step 6: Handle Stop-Loss and Take-Profit selection
-              bot.once("callback_query", async (slTpCallback) => {
-                const [action, choice] = slTpCallback.data.split(":");
-                const chatId = slTpCallback.message.chat.id;
+              bot.once("callback_query", async (approveCallback) => {
+                const [action, value] = approveCallback.data.split(":");
+                
+                if (action === "approve" && value !== "cancel") {
+                  const approveMsg = {
+                    chat: { id: sizeMsg.chat.id },
+                    text: `/approve ${value}`
+                  };
 
-                let text;
-                if(buy){
-                  text = `Below the market price of ${parseFloat(Price).toFixed(3)}`
-                } else {
-                  text = `Above the market price of ${parseFloat(Price).toFixed(3)}`
-                }
+                  const approvalSuccess = await handleApprove(bot, approveMsg);
+                  
+                  if (!approvalSuccess) {
+                    await bot.sendMessage(sizeMsg.chat.id, "Approval failed or was rejected. Please try again /openmarket");
+                    return;
+                  }
 
-                if (choice === "no") {
-                  // Proceed with default 0 for stop-loss and take-profit
-                  await proceedWithTrade(bot, chatId, selectedPair, size, leverage, Price, buy, 0, 0);
-                } else {
-                  // Prompt for Stop-Loss
-                  await bot.sendMessage(chatId, `Enter stop-loss price ${text}:`);
+                  await bot.sendMessage(sizeMsg.chat.id, 
+                    `Size: ${size} USDC. Now enter leverage:\nMax leverage for this pair is ${maxLeverage}x`
+                  );
 
-                  bot.once("message", async (slMsg) => {
-                    const stopLoss = slMsg.text;
-
-                    if (isNaN(stopLoss) || parseFloat(stopLoss) <= 0) {
-                      await bot.sendMessage(slMsg.chat.id, "Invalid stop-loss. Please enter a valid price.");
+                  bot.once("message", async (leverageMsg) => {
+                    const leverage = leverageMsg.text;
+                    
+                    if (isNaN(leverage) || parseFloat(leverage) <= 0 || parseFloat(leverage) > maxLeverage) {
+                      await bot.sendMessage(leverageMsg.chat.id, `Invalid leverage. Please enter a valid number between 1 and ${maxLeverage}x`);
                       return;
                     }
 
-                    // Prompt for Take-Profit
-                    await bot.sendMessage(slMsg.chat.id, "Enter take-profit price (or 0 to skip):");
+                    tradeState.leverage = parseFloat(leverage);
 
-                    bot.once("message", async (tpMsg) => {
-                      const takeProfit = tpMsg.text;
+                    const slTpOptions = {
+                      reply_markup: JSON.stringify({
+                        inline_keyboard: [
+                          [{ text: "Yes", callback_data: "set_sl_tp:yes" }],
+                          [{ text: "No", callback_data: "set_sl_tp:no" }],
+                        ],
+                      }),
+                    };
 
-                      if (isNaN(takeProfit) || parseFloat(takeProfit) < 0) {
-                        await bot.sendMessage(tpMsg.chat.id, "Invalid take-profit. Please enter a valid price or 0.");
-                        return;
+                    await bot.sendMessage(leverageMsg.chat.id, "Would you like to set Stop Loss and Take Profit?", slTpOptions);
+
+                    bot.once("callback_query", async (slTpCallback) => {
+                      const [action, value] = slTpCallback.data.split(":");
+                      
+                      if (value === "yes") {
+                        await bot.sendMessage(slTpCallback.message.chat.id, `Enter Stop Loss price (or 'skip' to skip):\n`+
+                          `Set Stoploss ${tradeState.buy?`Below`:`Above`} Market Price ${tradeState.price>1?`${parseFloat(tradeState.price).toFixed(2)}`:`${parseFloat(tradeState.price).toFixed(2)}$`}\n`
+                          
+                        );
+                        
+                        bot.once("message", async (slMsg) => {
+                          if (slMsg.text.toLowerCase() === 'skip') {
+                            tradeState.stopLoss = 0;
+                          } else {
+                            const stopLoss = parseFloat(slMsg.text);
+                            if (isNaN(stopLoss) || stopLoss <= 0) {
+                              await bot.sendMessage(slMsg.chat.id, "Invalid Stop Loss. Please try again /openmarket");
+                              return;
+                            }
+                            tradeState.stopLoss = stopLoss;
+                          }
+
+                          await bot.sendMessage(slMsg.chat.id, `Enter Take Profit price (or 'skip' to skip):\n`+
+                            `Set Take Profit ${tradeState.buy?`Above`:`Below`} Market Price ${tradeState.price>1?`${parseFloat(tradeState.price).toFixed(2)}`:`${parseFloat(tradeState.price).toFixed(2)}$`}\n`
+
+                          );
+                          
+                          bot.once("message", async (tpMsg) => {
+                            if (tpMsg.text.toLowerCase() === 'skip') {
+                              tradeState.takeProfit = 0;
+                            } else {
+                              const takeProfit = parseFloat(tpMsg.text);
+                              if (isNaN(takeProfit) || takeProfit <= 0) {
+                                await bot.sendMessage(tpMsg.chat.id, "Invalid Take Profit. Please try again /openmarket");
+                                return;
+                              }
+                              tradeState.takeProfit = takeProfit;
+                            }
+
+                            await bot.sendMessage(tpMsg.chat.id, "Please check your wallet for trade confirmation...");
+                            await proceedWithTrade(
+                              bot,
+                              tpMsg.chat.id,
+                              tradeState.selectedPair,
+                              tradeState.size,
+                              tradeState.leverage,
+                              tradeState.price,
+                              tradeState.buy,
+                              tradeState.stopLoss || 0,
+                              tradeState.takeProfit || 0
+                            );
+                          });
+                        });
+                      } else {
+                        tradeState.stopLoss = 0;
+                        tradeState.takeProfit = 0;
+                        await bot.sendMessage(slTpCallback.message.chat.id, "Please check your wallet for trade confirmation...");
+                        await proceedWithTrade(
+                          bot,
+                          slTpCallback.message.chat.id,
+                          tradeState.selectedPair,
+                          tradeState.size,
+                          tradeState.leverage,
+                          tradeState.price,
+                          tradeState.buy,
+                          0,
+                          0
+                        );
                       }
-
-                      // Proceed with trade
-                      await proceedWithTrade(bot, tpMsg.chat.id, selectedPair, size, leverage, Price, buy, stopLoss, takeProfit);
                     });
                   });
+                } else {
+                  await bot.sendMessage(sizeMsg.chat.id, "Trade cancelled. Use /openmarket to start again.");
+                  return;
                 }
               });
-            });
-          } catch (balanceError) {
-            console.error("Balance/Allowance check error:", balanceError);
-            await bot.sendMessage(sizeMsg.chat.id, "Error checking wallet balance. Please try again.");
+            } else {
+              await bot.sendMessage(sizeMsg.chat.id, 
+                `Size: ${size} USDC. Now enter leverage:\nMax leverage for this pair is ${maxLeverage}x`
+              );
+
+              bot.once("message", async (leverageMsg) => {
+                const leverage = leverageMsg.text;
+                
+                if (isNaN(leverage) || parseFloat(leverage) <= 0 || parseFloat(leverage) > maxLeverage) {
+                  await bot.sendMessage(leverageMsg.chat.id, `Invalid leverage. Please enter a valid number between 1 and ${maxLeverage}x`);
+                  return;
+                }
+
+                tradeState.leverage = parseFloat(leverage);
+
+                const slTpOptions = {
+                  reply_markup: JSON.stringify({
+                    inline_keyboard: [
+                      [{ text: "Yes", callback_data: "set_sl_tp:yes" }],
+                      [{ text: "No", callback_data: "set_sl_tp:no" }],
+                    ],
+                  }),
+                };
+
+                await bot.sendMessage(leverageMsg.chat.id, "Would you like to set Stop Loss and Take Profit?", slTpOptions);
+
+                bot.once("callback_query", async (slTpCallback) => {
+                  const [action, value] = slTpCallback.data.split(":");
+                  
+                  if (value === "yes") {
+                    await bot.sendMessage(slTpCallback.message.chat.id, "Enter Stop Loss price (or 'skip' to skip):\n"+
+                      `Set Stoploss ${tradeState.buy?`Below`:`Above`} Current Price ${tradeState.price>1?`${parseFloat(tradeState.price).toFixed(2)}$`:`${parseFloat(tradeState.price).toFixed(2)}$`}\n`
+
+                    );
+                    
+                    bot.once("message", async (slMsg) => {
+                      if (slMsg.text.toLowerCase() === 'skip') {
+                        tradeState.stopLoss = 0;
+                      } else {
+                        const stopLoss = parseFloat(slMsg.text);
+                        if (isNaN(stopLoss) || stopLoss <= 0) {
+                          await bot.sendMessage(slMsg.chat.id, "Invalid Stop Loss. Please try again /openmarket");
+                          return;
+                        }
+                        tradeState.stopLoss = stopLoss;
+                      }
+
+                      await bot.sendMessage(slMsg.chat.id, `Enter Take Profit price (or 'skip' to skip):\n`+
+                        `Set Take profit ${tradeState.buy?`Above`:`Below`} Current Price ${tradeState.price>1?`${parseFloat(tradeState.price).toFixed(2)}$`:`${parseFloat(tradeState.price).toFixed(2)}$`}\n`
+
+                      );
+                      
+                      bot.once("message", async (tpMsg) => {
+                        if (tpMsg.text.toLowerCase() === 'skip') {
+                          tradeState.takeProfit = 0;
+                        } else {
+                          const takeProfit = parseFloat(tpMsg.text);
+                          if (isNaN(takeProfit) || takeProfit <= 0) {
+                            await bot.sendMessage(tpMsg.chat.id, "Invalid Take Profit. Please try again /openmarket");
+                            return;
+                          }
+                          tradeState.takeProfit = takeProfit;
+                        }
+
+                        await bot.sendMessage(tpMsg.chat.id, "Please check your wallet for trade confirmation...");
+                        await proceedWithTrade(
+                          bot,
+                          tpMsg.chat.id,
+                          tradeState.selectedPair,
+                          tradeState.size,
+                          tradeState.leverage,
+                          tradeState.price,
+                          tradeState.buy,
+                          tradeState.stopLoss || 0,
+                          tradeState.takeProfit || 0
+                        );
+                      });
+                    });
+                  } else {
+                    tradeState.stopLoss = 0;
+                    tradeState.takeProfit = 0;
+                    await bot.sendMessage(slTpCallback.message.chat.id, "Please check your wallet for trade confirmation...");
+                    await proceedWithTrade(
+                      bot,
+                      slTpCallback.message.chat.id,
+                      tradeState.selectedPair,
+                      tradeState.size,
+                      tradeState.leverage,
+                      tradeState.price,
+                      tradeState.buy,
+                      0,
+                      0
+                    );
+                  }
+                });
+              });
+            }
+          } catch (error) {
+            console.error("Trade processing error:", error);
+            await bot.sendMessage(sizeMsg.chat.id, "Error processing trade. Please try again.");
           }
         });
       });
@@ -1081,7 +1253,10 @@ async function handleMarketTrade(bot, msg) {
   }
 }
 
-// New function to handle trade execution with blockchain confirmation
+//New function to handle trade execution with blockchain confirmation
+
+
+
 async function proceedWithTrade(bot, chatId, selectedPair, size, leverage, Price, buy, stopLoss, takeProfit) {
   try {
     const userSession = await getUserSession(chatId);
@@ -1094,10 +1269,10 @@ async function proceedWithTrade(bot, chatId, selectedPair, size, leverage, Price
       pairIndex: PAIRS_OBJECT[selectedPair],
       index: 0,
       initialPosToken: 0,
-      positionSizeUSDC: ethers.parseUnits(size, 6),
-      openPrice: ethers.parseUnits(Price, 10),
+      positionSizeUSDC: ethers.parseUnits(size.toString(), 6),
+      openPrice: ethers.parseUnits(Price.toString(), 10),
       buy: buy,
-      leverage: ethers.parseUnits(leverage, 10),
+      leverage: ethers.parseUnits(leverage.toString(), 10),
       tp: takeProfit ? ethers.parseUnits(takeProfit.toString(), 10) : 0,
       sl: stopLoss ? ethers.parseUnits(adjustedStopLoss.toString(), 10) : 0,
       timestamp: Math.floor(Date.now() / 1000),
@@ -1128,11 +1303,6 @@ async function proceedWithTrade(bot, chatId, selectedPair, size, leverage, Price
       executionFee,
     ]);
 
-    await bot.sendMessage(
-      chatId,
-      `Approve Trade in your wallet...`
-    );
-
     // Send transaction request
     const { result } = await makeWalletConnectRequest(`/request/${userSession.topic}`, "POST", {
       chainId: `eip155:${BASE_CHAIN_ID}`,
@@ -1149,74 +1319,70 @@ async function proceedWithTrade(bot, chatId, selectedPair, size, leverage, Price
       },
     });
 
-    // Initial message about transaction submission
-    const initialMessage = await bot.sendMessage(
-      chatId,
-      `Trade transaction submitted! Hash: ${result}\nWaiting for blockchain confirmation...`
-    );
+   // Initial message about transaction submission
+   const initialMessage = await bot.sendMessage(
+    chatId,
+    `Market trade transaction submitted! Hash: ${result}\n`+
+    `Waiting for blockchain confirmation...`
+  );
 
-    // Wait for blockchain confirmations
-    let confirmations = 0;
-    const maxWaitTime = 5 * 60 * 1000; // 5 minutes
-    const startTime = Date.now();
+  // Wait for blockchain confirmations
+  const startTime = Date.now();
+  const maxWaitTime = 2 * 60 * 1000; // 2 minutes timeout
 
-    const checkConfirmations = async () => {
-      try {
-        const receipt = await Provider.getTransactionReceipt(result);
-        
-        if (receipt) {
-          confirmations = receipt.confirmations || 0;
-          
-          if (confirmations >= 2) {
-            // Update message to confirmed
-            await bot.editMessageText(
-              `Trade confirmed on blockchain! ✅\n` +
-              `Transaction Hash: ${result}\n` +
-              `Confirmations: ${confirmations}\n` +
-              `Check your open trades using /opentrades`,
-              {
-                chat_id: chatId,
-                message_id: initialMessage.message_id
-              }
-            );
+  const checkConfirmations = async () => {
+    try {
+      const receipt = await Provider.getTransactionReceipt(result);
+      
+      if (receipt) {
+        const currentBlock = await Provider.getBlockNumber();
+        const confirmations = currentBlock - receipt.blockNumber;
 
-            // Store trade
-            const mockOrderId = Date.now().toString();
-            await storeTrade(chatId, mockOrderId, result);
+        console.log("Current Block:", currentBlock, "Confirmations:", confirmations);
 
-            return true;
-          }
-        }
-
-        // If not enough confirmations and not timed out, check again
-        if (Date.now() - startTime < maxWaitTime) {
-          setTimeout(checkConfirmations, 15000); // Check every 15 seconds
-        } else {
-          // Timeout occurred
+        if (confirmations >= 3) {
           await bot.editMessageText(
-            `Trade submission timed out. Please check transaction status manually.\n` +
-            `Transaction Hash: ${result}`,
+            `Market Order Confirmed! ✅\n` +
+            `Transaction Hash: ${result}\n` +
+            `Confirmations: ${confirmations}\n` +
+            `Check your trades using /opentrades.`,
             {
-              chat_id: chatId,
+              chat_id: initialMessage.chat.id,
               message_id: initialMessage.message_id
             }
           );
+          return; // Exit after successful confirmation
         }
-      } catch (error) {
-        console.error("Confirmation check error:", error);
+      }
+
+      if (Date.now() - startTime < maxWaitTime) { 
+        setTimeout(checkConfirmations, 5000); // Check every 5 seconds
+      } else {
         await bot.editMessageText(
-          `Error checking transaction confirmation.\n` +
+          `Market Order transaction timed out. Please check /opentrades to verify status.\n` +
           `Transaction Hash: ${result}`,
           {
-            chat_id: chatId,
+            chat_id: initialMessage.chat.id,
             message_id: initialMessage.message_id
           }
         );
       }
-    };
+    } catch (error) {
+      console.error("Market trade confirmation check error:", error);
+      // Optionally notify user of error
+      await bot.editMessageText(
+        `Error checking Market Order status. Please check /opentrades to verify status.\n` +
+        `Transaction Hash: ${result}`,
+        {
+          chat_id: initialMessage.chat.id,
+          message_id: initialMessage.message_id
+        }
+      );
+    }
+  };
 
-    // Start confirmation checking
-    await checkConfirmations();
+  await checkConfirmations();
+    
 
   } catch (error) {
     console.error("Open trade error:", error.message);
@@ -1285,17 +1451,18 @@ async function handleGetTrades(bot, msg, contractInstance) {
 
         💰 Position Details
         ────────────────────
-        📍 Position Size: ${ethers.formatUnits(trade.initialPosToken, 6)} USDC
+        📍 Position Size: ${parseFloat(ethers.formatUnits(trade.initialPosToken, 6)).toFixed(2)} USDC
         ⚡ Leverage: ${ethers.formatUnits(trade.leverage, 10)}x
+        💰 Volume: ${parseFloat(ethers.formatUnits(trade.initialPosToken, 6)*ethers.formatUnits(trade.leverage, 10))}
 
         🎯 Trade Markers
         ────────────────────
-        🔹 Open Price: ${parseFloat(openPrice).toFixed(4)}$
-        💹 Current Price: ${parseFloat(currentPrices).toFixed(4) || "NaN"}$
+        🔹 Open Price: ${openPrice>1?parseFloat(openPrice).toFixed(2):parseFloat(openPrice).toFixed(4)}$
+        💹 Current Price: ${currentPrices>1?parseFloat(currentPrices).toFixed(2) || "NaN":parseFloat(currentPrices).toFixed(4) || "NaN"}$
          
-        🚦 Take Profit: ${parseFloat(ethers.formatUnits(trade.tp, 10)).toFixed(4)}$
-        ⚠️ Stop Loss: ${parseFloat(ethers.formatUnits(trade.sl, 10)).toFixed(4)}$
-        💥 Liquidation: ${parseFloat(ethers.formatUnits(trade.liquidationPrice, 10)).toFixed(4)}$
+        🚦 Take Profit: ${trade?.tp>1?parseFloat(ethers.formatUnits(trade.tp, 10)).toFixed(2):parseFloat(ethers.formatUnits(trade.tp, 10)).toFixed(4)}$
+        ⚠️ Stop Loss: ${trade?.sl>1?parseFloat(ethers.formatUnits(trade.sl, 10)).toFixed(2):parseFloat(ethers.formatUnits(trade.sl, 10)).toFixed(4)}$
+        💥 Liquidation: ${trade?.liquidationPrice>1?parseFloat(ethers.formatUnits(trade.liquidationPrice, 10)).toFixed(2):parseFloat(ethers.formatUnits(trade.liquidationPrice, 10)).toFixed(4)}$
 
 
         ${trade.buy ? "🚀 Riding the Bullish Wave" : "🐻 Navigating Bearish Currents"}
@@ -1375,8 +1542,7 @@ async function handleTradeCloseCallback(bot, query, contractInstance,size) {
   }
 
  
-  
-  
+
   const callbackData = query.data.split(":");
   console.log(query.data)
   const pairIndex = parseInt(callbackData[1], 10);
@@ -1426,8 +1592,67 @@ async function handleTradeCloseCallback(bot, query, contractInstance,size) {
       },
     });
 
-    await bot.sendMessage(query.message.chat.id, `Trade transaction submitted! Hash: ${result}\nWaiting for confirmation...`);
+    const initialMessage = await bot.sendMessage(
+      chatId,
+      `Market Close transaction submitted! Hash: ${result}\n`+
+      `Waiting for blockchain confirmation...`
+    );
 
+    // Wait for blockchain confirmations
+    const startTime = Date.now();
+    const maxWaitTime = 2 * 60 * 1000; // 2 minutes timeout
+
+    const checkConfirmations = async () => {
+      try {
+        const receipt = await Provider.getTransactionReceipt(result);
+        
+        if (receipt) {
+          const currentBlock = await Provider.getBlockNumber();
+          const confirmations = currentBlock - receipt.blockNumber;
+
+          console.log("Current Block:", currentBlock, "Confirmations:", confirmations);
+
+          if (confirmations >= 3) {
+            await bot.editMessageText(
+              `Position Closed Successfully! ✅\n` +
+              `Transaction Hash: ${result}\n` +
+              `Confirmations: ${confirmations}\n` +
+              `Check your trades using /closedtrades.`,
+              {
+                chat_id: initialMessage.chat.id,
+                message_id: initialMessage.message_id
+              }
+            );
+            return; // Exit after successful confirmation
+          }
+        }
+
+        if (Date.now() - startTime < maxWaitTime) { 
+          setTimeout(checkConfirmations, 5000); // Check every 5 seconds
+        } else {
+          await bot.editMessageText(
+            `Market Close transaction timed out. Please check /opentrades to verify status.\n` +
+            `Transaction Hash: ${result}`,
+            {
+              chat_id: initialMessage.chat.id,
+              message_id: initialMessage.message_id
+            }
+          );
+        }
+      } catch (error) {
+        console.error("Market close confirmation check error:", error);
+        await bot.editMessageText(
+          `Error checking Market Close status. Please check /opentrades to verify status.\n` +
+          `Transaction Hash: ${result}`,
+          {
+            chat_id: initialMessage.chat.id,
+            message_id: initialMessage.message_id
+          }
+        );
+      }
+    };
+
+    await checkConfirmations();
   } catch (error) {
     // console.log(error.message)
     await bot.answerCallbackQuery(query.id, { text: "Failed to close trade. Try again later." });
@@ -1437,39 +1662,31 @@ async function handleTradeCloseCallback(bot, query, contractInstance,size) {
 async function handleTradeCloseCallback_limit(bot, query, contractInstance) {
   const chatId = query.message.chat.id;
 
-  const userSession = await getUserSession(chatId);
-  if (!userSession || !userSession.address) {
-    await bot.sendMessage(chatId, "Please connect your wallet first using /connect");
-    return;
-  }
-  
-  const callbackData = query.data.split(":");
-  console.log(query.data)
-  const pairIndex = parseInt(callbackData[1], 10);
-  const tradeIndex = parseInt(callbackData[2], 10);
-  
-
   try {
-
-    // Execution fee (you may replace this with dynamic calculation if needed)
-    const tradeParams = {
-      pairIndex: pairIndex, // Map `selectedPair` to pairIndex based on backend logic
-      index: tradeIndex,
-    };
-
-    console.log(tradeParams)
-
+    // Check user session
+    const userSession = await getUserSession(chatId);
+    if (!userSession || !userSession.address) {
+      await bot.answerCallbackQuery(query.id);  // Close the callback query
+      await bot.sendMessage(chatId, "Please connect your wallet first using /connect");
+      return;
+    }
+  
+    const callbackData = query.data.split(":");
+    console.log("Callback data:", query.data);
+    const pairIndex = parseInt(callbackData[1], 10);
+    const tradeIndex = parseInt(callbackData[2], 10);
 
     // Encode the function call
     const iface = new ethers.Interface(TRADING_ABI);
     const data = iface.encodeFunctionData('cancelOpenLimitOrder', [
-        tradeParams.pairIndex,
-        tradeParams.index,
+        pairIndex,
+        tradeIndex,
     ]);
 
-    await bot.sendMessage(query.message.chat.id, 'Check your wallet for approval...');
+    // Send initial wallet check message
+    const walletMsg = await bot.sendMessage(chatId, 'Check your wallet for approval...');
 
-
+    // Make wallet connect request
     const { result } = await makeWalletConnectRequest(`/request/${userSession.topic}`, 'POST', {
       chainId: `eip155:${BASE_CHAIN_ID}`,
       request: {
@@ -1485,11 +1702,95 @@ async function handleTradeCloseCallback_limit(bot, query, contractInstance) {
       },
     });
 
-    await bot.sendMessage(query.message.chat.id, `Trade transaction submitted! Hash: ${result}\nWaiting for confirmation...`);
+    // Delete the wallet check message
+    await bot.deleteMessage(chatId, walletMsg.message_id);
 
+    // Send the initial transaction message
+    const initialMessage = await bot.sendMessage(
+      chatId,
+      `Cancel Limit Order submitted! Hash: ${result}\n`+
+      `Pair Index: ${pairIndex}, Trade Index: ${tradeIndex}\n`+
+      `Waiting for blockchain confirmation...`
+    );
+
+    // Answer the callback query to remove loading state
+    await bot.answerCallbackQuery(query.id);
+
+    // Wait for blockchain confirmations
+    const startTime = Date.now();
+    const maxWaitTime = 2 * 60 * 1000; // 2 minutes timeout
+
+    const checkConfirmations = async () => {
+      try {
+        const receipt = await Provider.getTransactionReceipt(result);
+        
+        if (receipt) {
+          const currentBlock = await Provider.getBlockNumber();
+          const confirmations = currentBlock - receipt.blockNumber;
+
+          if (confirmations >= 3) {
+            await bot.editMessageText(
+              `Cancel Limit Order Successful! ✅\n` +
+              `Pair Index: ${pairIndex}, Trade Index: ${tradeIndex}\n` +
+              `Transaction Hash: ${result}\n` +
+              `Confirmations: ${confirmations}\n` +
+              `Check your trades using /opentrades.`,
+              {
+                chat_id: initialMessage.chat.id,
+                message_id: initialMessage.message_id,
+                parse_mode: 'HTML'
+              }
+            );
+            return; // Exit after successful confirmation
+          }
+        }
+
+        if (Date.now() - startTime < maxWaitTime) { 
+          setTimeout(checkConfirmations, 5000); // Check every 5 seconds
+        } else {
+          await bot.editMessageText(
+            `Cancel Limit Order transaction timed out. Please check /opentrades to verify status.\n` +
+            `Pair Index: ${pairIndex}, Trade Index: ${tradeIndex}\n` +
+            `Transaction Hash: ${result}`,
+            {
+              chat_id: initialMessage.chat.id,
+              message_id: initialMessage.message_id,
+              parse_mode: 'HTML'
+            }
+          );
+        }
+      } catch (error) {
+        console.error("Cancel limit order confirmation check error:", error);
+        // Only try to edit message if we still have the message ID
+        if (initialMessage?.message_id) {
+          await bot.editMessageText(
+            `Error checking Cancel Limit Order status. Please check /opentrades to verify status.\n` +
+            `Pair Index: ${pairIndex}, Trade Index: ${tradeIndex}\n` +
+            `Transaction Hash: ${result}`,
+            {
+              chat_id: initialMessage.chat.id,
+              message_id: initialMessage.message_id,
+              parse_mode: 'HTML'
+            }
+          );
+        }
+      }
+    };
+
+    await checkConfirmations();
   } catch (error) {
-    // console.log(error.message)
-    await bot.answerCallbackQuery(query.id, { text: "Failed to close trade. Try again later." });
+    console.error("Handle limit trade cancellation error:", error);
+    // Make sure to answer the callback query in case of error
+    try {
+      await bot.answerCallbackQuery(query.id, { 
+        text: "Failed to cancel limit order. Please try again later.",
+        show_alert: true 
+      });
+    } catch (cbError) {
+      console.error("Error answering callback query:", cbError);
+    }
+    // Send a separate error message
+    await bot.sendMessage(chatId, "❌ Failed to cancel limit order. Please try again later.");
   }
 }
 
