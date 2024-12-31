@@ -80,7 +80,7 @@ async function makeWalletConnectRequest(endpoint, method = 'GET', data = null) {
       url: `${WALLET_CONNECT_SERVICE_URL}${endpoint}`,
       data,
       headers: {
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json'  
       }
     });
     return response.data;

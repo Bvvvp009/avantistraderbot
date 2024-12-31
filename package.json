@@ -21,14 +21,17 @@
     "@walletconnect/utils": "^2.17.2",
     "@walletconnect/web3-provider": "^1.8.0",
     "@walletconnect/web3wallet": "^1.16.1",
-    "dotenv": "^16.4.5",
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.7",
     "ethers": "^6.13.4",
     "express": "^4.21.1",
-    "express-rate-limit": "^7.4.1",
+    "express-rate-limit": "^7.5.0",
+    "generic-pool": "^3.9.0",
     "helmet": "^8.0.0",
     "node-telegram-bot-api": "^0.64.0",
     "qrcode": "^1.5.4",
     "sqlite3": "^5.1.7",
-    "walletconnect": "^1.7.8"
+    "walletconnect": "^1.7.8",
+    "winston": "^3.17.0"
   }
 }

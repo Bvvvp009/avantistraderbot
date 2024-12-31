@@ -160,7 +160,7 @@ app.post('/connect', checkSignClient, async (req, res) => {
                 }
             }
         });
-
+    
         // Generate a temporary topic ID
         const tempTopic = `pending_${Date.now()}`;
         
@@ -179,7 +179,8 @@ app.post('/connect', checkSignClient, async (req, res) => {
         try {
             // Handle approval asynchronously
             const session = await approval();
-            
+             
+            console.log(session)
             // Store the mapping between temporary and final topics
             topicMapping.set(tempTopic, session.topic);
             
@@ -222,7 +223,7 @@ app.get('/session-status/:topic', (req, res) => {
     // Check both temporary and final topics
     const tempSessionData = activeSessions.get(requestedTopic);
     const finalSessionData = finalTopic ? activeSessions.get(finalTopic) : null;
-    
+    console.log(tempSessionData,finalSessionData)
     if (!tempSessionData && !finalSessionData) {
         res.status(404).json({ error: 'Session not found' });
         return;
@@ -355,7 +356,7 @@ function startMonitoring() {
         }
     }, 30 * 60 * 1000); // Every 30 minutes
 
-    return { sessionCleanupInterval, healthCheckInterval };
+    return { sessionCleanupInterval };
 }
 
 // Graceful shutdown handler
