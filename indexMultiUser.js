@@ -65,6 +65,7 @@ async function initDatabase() {
                     timestamp INTEGER,
                     tx_hash TEXT,
                     trade_status TEXT DEFAULT 'pending',
+                    trade_type TEXT,
                     last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (chat_id, order_id)
                 )
@@ -92,7 +93,24 @@ async function initDatabase() {
     });
 }
 
-// Enhanced WalletConnect request handler with retry and state management
+// Store active requests with timestamps and additional metadata
+const activeRequests = new Map();
+
+// Timeout duration (5 minutes)
+const REQUEST_TIMEOUT = 5 * 60 * 1000;
+
+// Cleanup interval (1 minute)
+const CLEANUP_INTERVAL = 60 * 1000;
+
+// Clean up old requests periodically
+setInterval(() => {
+    const now = Date.now();
+    for (const [requestId, data] of activeRequests.entries()) {
+        if (now - data.timestamp > REQUEST_TIMEOUT) {
+            activeRequests.delete(requestId);
+        }
+    }
+}, CLEANUP_INTERVAL);
 
 async function makeWalletConnectRequest(endpoint, method = 'GET', data = null, chatId = null) {
     try {
@@ -110,13 +128,23 @@ async function makeWalletConnectRequest(endpoint, method = 'GET', data = null, c
             headers: {
                 'Content-Type': 'application/json'
             },
-            // Add timeout
-            timeout: 30000
+            timeout: 60000
         });
-console.log("responsessssss:",response.data)
+
+        // If this is a trade request, store it in activeRequests
+        if (endpoint.includes('/request/') && response.data.result) {
+            activeRequests.set(response.data.result, {
+                timestamp: Date.now(),
+                chatId: chatId,
+                endpoint: endpoint,
+                type: data?.request?.method || 'unknown',
+                status: 'pending'
+            });
+        }
+
         // Update last activity timestamp
         if (chatId) {
-             db.run(
+            await db.run(
                 `UPDATE user_sessions 
                  SET last_activity = CURRENT_TIMESTAMP 
                  WHERE chat_id = ?`,
@@ -142,6 +170,82 @@ console.log("responsessssss:",response.data)
         throw error;
     }
 }
+
+// Function to check if a request is valid
+function isValidRequest(txHash, chatId) {
+    const requestData = activeRequests.get(txHash);
+    if (!requestData) {
+        return false; // Request not found
+    }
+
+    if (requestData.chatId !== chatId) {
+        return false; // Request belongs to different user
+    }
+
+    if (Date.now() - requestData.timestamp > REQUEST_TIMEOUT) {
+        activeRequests.delete(txHash); // Clean up expired request
+        return false;
+    }
+
+    return true;
+}
+
+// Function to update request status
+function updateRequestStatus(txHash, status) {
+    const requestData = activeRequests.get(txHash);
+    if (requestData) {
+        requestData.status = status;
+        activeRequests.set(txHash, requestData);
+    }
+}
+
+// Function to get all active requests for a user
+function getUserActiveRequests(chatId) {
+    const userRequests = [];
+    for (const [txHash, data] of activeRequests.entries()) {
+        if (data.chatId === chatId) {
+            userRequests.push({
+                txHash,
+                ...data
+            });
+        }
+    }
+    return userRequests;
+}
+
+// Function to cancel specific request
+async function cancelWalletConnectRequest(txHash, chatId) {
+    const requestData = activeRequests.get(txHash);
+    if (requestData && requestData.chatId === chatId) {
+        try {
+            // Attempt to cancel on WalletConnect service if needed
+            await axios({
+                method: 'POST',
+                url: `${WALLET_CONNECT_SERVICE_URL}/cancel/${txHash}`,
+                data: { chatId },
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                timeout: 30000
+            });
+        } catch (error) {
+            console.error('Error canceling request:', error);
+        } finally {
+            activeRequests.delete(txHash);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Function to cancel all requests for a user
+async function cancelAllUserRequests(chatId) {
+    const userRequests = getUserActiveRequests(chatId);
+    for (const request of userRequests) {
+        await cancelWalletConnectRequest(request.txHash, chatId);
+    }
+}
+
 
 // Bot state management utilities
 const userTradeFlows = new Map(); // Track active trade flows per user
@@ -773,7 +877,60 @@ async function handleApprove(bot, msg, tradeState = null) {
 }
 
 
-// handleLimitTrade function
+// User state management
+const userTradeStates = new Map();
+
+// Transaction queue implementation
+class TransactionQueue {
+    constructor() {
+        this.queues = new Map();
+    }
+    
+    async addTransaction(userId, transaction) {
+        if (!this.queues.has(userId)) {
+            this.queues.set(userId, []);
+        }
+        
+        const userQueue = this.queues.get(userId);
+        userQueue.push(transaction);
+        
+        if (userQueue.length === 1) {
+            await this.processQueue(userId);
+        }
+    }
+    
+    async processQueue(userId) {
+        const userQueue = this.queues.get(userId);
+        
+        while (userQueue.length > 0) {
+            const transaction = userQueue[0];
+            try {
+                await transaction();
+            } catch (error) {
+                console.error(`Transaction failed for user ${userId}:`, error);
+            }
+            userQueue.shift();
+        }
+    }
+}
+
+const txQueue = new TransactionQueue();
+
+// Helper function to create user-specific event handlers
+function createUserSpecificHandler(bot, chatId, eventType, handler) {
+    const wrappedHandler = async (event) => {
+        if (event.chat?.id === chatId || event.message?.chat.id === chatId) {
+            try {
+                await handler(event);
+            } finally {
+                bot.removeListener(eventType, wrappedHandler);
+            }
+        }
+    };
+    return wrappedHandler;
+}
+
+// Main limit trade handler
 async function handleLimitTrade(bot, msg) {
     const chatId = msg.chat.id;
     try {
@@ -783,7 +940,7 @@ async function handleLimitTrade(bot, msg) {
             return;
         }
 
-        // Initialize limit trade state
+        // Initialize user-specific trade state
         const tradeState = {
             selectedPair: null,
             size: null,
@@ -798,67 +955,80 @@ async function handleLimitTrade(bot, msg) {
 
         // Save initial state
         await saveUserState(chatId, 'limit_trade', tradeState);
+        userTradeStates.set(chatId, tradeState);
 
         // Show pairs menu
-        await showPairsMenu(bot, chatId, "limit");
+         showPairsMenu(bot, chatId, "limit");
 
-        // Handle pair selection
-        bot.once("callback_query", async (callbackQuery) => {
-            if (callbackQuery.message.chat.id !== chatId) return;
-            
-            const { data, message } = callbackQuery;
-            const [action, type, selectedPair] = data.split(":");
+        // Create and attach pair selection handler
+        const pairSelectionHandler = createUserSpecificHandler(
+            bot,
+            chatId,
+            'callback_query',
+            async (callbackQuery) => {
+                const { data, message } = callbackQuery;
+                const [action, type, selectedPair] = data.split(":");
 
-            if (action !== "select_pair" || type !== "limit") {
-                await bot.sendMessage(chatId, "Invalid selection. Please try again.");
-                return;
-            }
+                if (action !== "select_pair" || type !== "limit") {
+                    await bot.sendMessage(chatId, "Invalid selection. Please try again.");
+                    return;
+                }
 
-            try {
-                // Update trade state with selected pair
-                tradeState.selectedPair = selectedPair;
-                tradeState.price = await price({ id: [feedIds[selectedPair].id] });
-                const maxLeverage = feedIds[selectedPair].leverage || "NaN";
-                tradeState.maxLeverage = maxLeverage;
-                tradeState.stage = 'direction_selection';
-                
-                await saveUserState(chatId, 'limit_trade', tradeState);
-
-                // Show direction options
-                const options = {
-                    reply_markup: JSON.stringify({
-                        inline_keyboard: [
-                            [{ text: "Long 🟢", callback_data: `trade_direction:long:${selectedPair}` }],
-                            [{ text: "Short 🔴", callback_data: `trade_direction:short:${selectedPair}` }],
-                        ],
-                    }),
-                };
-
-                await bot.sendMessage(chatId, "Do you want to go Long🟢 or Short🔴?", options);
-
-                // Handle direction selection
-                bot.once("callback_query", async (directionCallback) => {
-                    if (directionCallback.message.chat.id !== chatId) return;
+                try {
+                    // Update trade state with selected pair
+                    const currentState = userTradeStates.get(chatId);
+                    currentState.selectedPair = selectedPair;
+                    currentState.price = await price({ id: [feedIds[selectedPair].id] });
+                    const maxLeverage = feedIds[selectedPair].leverage || "NaN";
+                    currentState.maxLeverage = maxLeverage;
+                    currentState.stage = 'direction_selection';
                     
-                    const directionData = directionCallback.data.split(":");
-                    const direction = directionData[1];
-                    tradeState.buy = direction === "long";
-                    tradeState.stage = 'size_input';
-                    
-                    await saveUserState(chatId, 'limit_trade', tradeState);
-                    await handleLimitTradeSize(bot, chatId, tradeState);
-                });
+                    await saveUserState(chatId, 'limit_trade', currentState);
 
-            } catch (error) {
-                console.error("Error in pair selection:", error);
-                await bot.sendMessage(chatId, "Error processing selection. Please try again.");
+                    // Show direction options
+                    const options = {
+                        reply_markup: JSON.stringify({
+                            inline_keyboard: [
+                                [{ text: "Long 🟢", callback_data: `trade_direction:long:${selectedPair}` }],
+                                [{ text: "Short 🔴", callback_data: `trade_direction:short:${selectedPair}` }],
+                            ],
+                        }),
+                    };
+
+                    await bot.sendMessage(chatId, "Do you want to go Long🟢 or Short🔴?", options);
+
+                    // Create and attach direction selection handler
+                    const directionHandler = createUserSpecificHandler(
+                        bot,
+                        chatId,
+                        'callback_query',
+                        async (directionCallback) => {
+                            const directionData = directionCallback.data.split(":");
+                            const direction = directionData[1];
+                            currentState.buy = direction === "long";
+                            currentState.stage = 'size_input';
+                            
+                            await saveUserState(chatId, 'limit_trade', currentState);
+                            await handleLimitTradeSize(bot, chatId, currentState);
+                        }
+                    );
+
+                    bot.on('callback_query', directionHandler);
+
+                } catch (error) {
+                    console.error("Error in pair selection:", error);
+                    await bot.sendMessage(chatId, "Error processing selection. Please try again.");
+                }
             }
-        });
+        );
+
+        bot.on('callback_query', pairSelectionHandler);
 
     } catch (error) {
         console.error("Handle limit trade error:", error);
         await bot.sendMessage(chatId, "Failed to open limit trade. Please try again.");
         await clearUserState(chatId);
+        userTradeStates.delete(chatId);
     }
 }
 
@@ -868,54 +1038,59 @@ async function handleLimitTradeSize(bot, chatId, tradeState) {
         `You selected ${tradeState.buy ? "Long 🟢" : "Short 🔴"}. Enter the size in USDC:`
     );
 
-    bot.once("message", async (sizeMsg) => {
-        if (sizeMsg.chat.id !== chatId) return;
-        
-        const size = sizeMsg.text;
-        if (isNaN(size) || parseFloat(size) <= 0) {
-            await bot.sendMessage(chatId, "Invalid size. Please enter a valid number.");
-            return;
-        }
-
-        try {
-            const userSession = await getUserSession(chatId);
-            const check_balance = await CONTRACT_INSTANCE_USDC.balanceOf(userSession.address);
-            const check_allowance = await CONTRACT_INSTANCE_USDC.allowance(
-                userSession.address, 
-                SPENDER_APPROVE
-            );
-            const requiredAmount = ethers.parseUnits(size.toString(), 6);
-            
-            tradeState.size = parseFloat(size);
-            tradeState.stage = 'approval_check';
-            await saveUserState(chatId, 'limit_trade', tradeState);
-
-            if (check_balance < requiredAmount) {
-                await bot.sendMessage(chatId, 
-                    `Insufficient balance!\n` +
-                    `Available Balance: ${ethers.formatUnits(check_balance, 6)} USDC\n` +
-                    `Required Amount: ${size} USDC`
-                );
+    const sizeHandler = createUserSpecificHandler(
+        bot,
+        chatId,
+        'message',
+        async (sizeMsg) => {
+            const size = sizeMsg.text;
+            if (isNaN(size) || parseFloat(size) <= 0) {
+                await bot.sendMessage(chatId, "Invalid size. Please enter a valid number.");
                 return;
             }
 
-            if (check_allowance < requiredAmount) {
-                await handleLimitInsufficientAllowance(
-                    bot,
-                    sizeMsg,
-                    check_allowance,
-                    size,
-                    tradeState
+            try {
+                const userSession = await getUserSession(chatId);
+                const check_balance = await CONTRACT_INSTANCE_USDC.balanceOf(userSession.address);
+                const check_allowance = await CONTRACT_INSTANCE_USDC.allowance(
+                    userSession.address, 
+                    SPENDER_APPROVE
                 );
-            } else {
-                await handleLimitLeverageInput(bot, chatId, tradeState);
-            }
+                const requiredAmount = ethers.parseUnits(size.toString(), 6);
+                
+                tradeState.size = parseFloat(size);
+                tradeState.stage = 'approval_check';
+                await saveUserState(chatId, 'limit_trade', tradeState);
 
-        } catch (error) {
-            console.error("Trade processing error:", error);
-            await bot.sendMessage(chatId, "Error processing trade. Please try again.");
+                if (check_balance < requiredAmount) {
+                    await bot.sendMessage(chatId, 
+                        `Insufficient balance!\n` +
+                        `Available Balance: ${ethers.formatUnits(check_balance, 6)} USDC\n` +
+                        `Required Amount: ${size} USDC`
+                    );
+                    return;
+                }
+
+                if (check_allowance < requiredAmount) {
+                    await handleLimitInsufficientAllowance(
+                        bot,
+                        sizeMsg,
+                        check_allowance,
+                        size,
+                        tradeState
+                    );
+                } else {
+                    await handleLimitLeverageInput(bot, chatId, tradeState);
+                }
+
+            } catch (error) {
+                console.error("Trade processing error:", error);
+                await bot.sendMessage(chatId, "Error processing trade. Please try again.");
+            }
         }
-    });
+    );
+
+    bot.on('message', sizeHandler);
 }
 
 async function handleLimitInsufficientAllowance(bot, sizeMsg, check_allowance, size, tradeState) {
@@ -942,30 +1117,36 @@ async function handleLimitInsufficientAllowance(bot, sizeMsg, check_allowance, s
         approveOptions
     );
 
-    bot.once("callback_query", async (approveCallback) => {
-        if (approveCallback.message.chat.id !== chatId) return;
-        
-        const [action, value] = approveCallback.data.split(":");
-        
-        if (action === "approve" && value !== "cancel") {
-            const approveMsg = {
-                chat: { id: chatId },
-                text: `/approve ${value}`
-            };
-
-            const approvalSuccess = await handleApprove(bot, approveMsg, tradeState);
+    const approveHandler = createUserSpecificHandler(
+        bot,
+        chatId,
+        'callback_query',
+        async (approveCallback) => {
+            const [action, value] = approveCallback.data.split(":");
             
-            if (!approvalSuccess) {
-                await bot.sendMessage(chatId, "Approval failed or was rejected. Please try again /openlimit");
-                return;
-            }
+            if (action === "approve" && value !== "cancel") {
+                const approveMsg = {
+                    chat: { id: chatId },
+                    text: `/approve ${value}`
+                };
 
-            await handleLimitLeverageInput(bot, chatId, tradeState);
-        } else {
-            await bot.sendMessage(chatId, "Trade cancelled. Use /openlimit to start again.");
-            await clearUserState(chatId);
+                const approvalSuccess = await handleApprove(bot, approveMsg, tradeState);
+                
+                if (!approvalSuccess) {
+                    await bot.sendMessage(chatId, "Approval failed or was rejected. Please try again /openlimit");
+                    return;
+                }
+
+                await handleLimitLeverageInput(bot, chatId, tradeState);
+            } else {
+                await bot.sendMessage(chatId, "Trade cancelled. Use /openlimit to start again.");
+                await clearUserState(chatId);
+                userTradeStates.delete(chatId);
+            }
         }
-    });
+    );
+
+    bot.on('callback_query', approveHandler);
 }
 
 async function handleLimitLeverageInput(bot, chatId, tradeState) {
@@ -975,291 +1156,205 @@ async function handleLimitLeverageInput(bot, chatId, tradeState) {
         `Max leverage for this pair is ${tradeState.maxLeverage}x`
     );
 
-    tradeState.stage = 'leverage_input';
-    await saveUserState(chatId, 'limit_trade', tradeState);
+    const leverageHandler = createUserSpecificHandler(
+        bot,
+        chatId,
+        'message',
+        async (leverageMsg) => {
+            const leverage = leverageMsg.text;
+            
+            if (isNaN(leverage) || parseFloat(leverage) <= 0 || parseFloat(leverage) > tradeState.maxLeverage) {
+                await bot.sendMessage(
+                    chatId, 
+                    `Invalid leverage. Please enter a valid number between 1 and ${tradeState.maxLeverage}x`
+                );
+                return;
+            }
 
-    bot.once("message", async (leverageMsg) => {
-        if (leverageMsg.chat.id !== chatId) return;
-        
-        const leverage = leverageMsg.text;
-        
-        if (isNaN(leverage) || parseFloat(leverage) <= 0 || parseFloat(leverage) > tradeState.maxLeverage) {
+            tradeState.leverage = parseFloat(leverage);
+            tradeState.stage = 'limit_price_input';
+            await saveUserState(chatId, 'limit_trade', tradeState);
+
+            let text = tradeState.buy
+                ? `Below ${tradeState.price > 1 ? parseFloat(tradeState.price).toFixed(2) : parseFloat(tradeState.price).toFixed(4)} $.`
+                : `Above ${tradeState.price > 1 ? parseFloat(tradeState.price).toFixed(2) : parseFloat(tradeState.price).toFixed(4)} $.`;
+
             await bot.sendMessage(
                 chatId, 
-                `Invalid leverage. Please enter a valid number between 1 and ${tradeState.maxLeverage}x`
+                `**Leverage: ${leverage}x**\n` +
+                `Present Trading price of selected pair: ${parseFloat(tradeState.price).toFixed(2)}$\n` +
+                `Enter the Limit Price ${text}`
             );
-            return;
+
+            await handleLimitPriceInput(bot, chatId, tradeState);
         }
+    );
 
-        tradeState.leverage = parseFloat(leverage);
-        tradeState.stage = 'limit_price_input';
-        await saveUserState(chatId, 'limit_trade', tradeState);
-
-        let text = tradeState.buy
-            ? `Below ${tradeState.price > 1 ? parseFloat(tradeState.price).toFixed(2) : parseFloat(tradeState.price).toFixed(4)} $.`
-            : `Above ${tradeState.price > 1 ? parseFloat(tradeState.price).toFixed(2) : parseFloat(tradeState.price).toFixed(4)} $.`;
-
-        await bot.sendMessage(
-            chatId, 
-            `**Leverage: ${leverage}x**\n` +
-            `Present Trading price of selected pair: ${parseFloat(tradeState.price).toFixed(2)}$\n` +
-            `Enter the Limit Price ${text}`
-        );
-
-        await handleLimitPriceInput(bot, chatId, tradeState);
-    });
+    bot.on('message', leverageHandler);
 }
 
 async function handleLimitPriceInput(bot, chatId, tradeState) {
-    bot.once("message", async (limitPriceMsg) => {
-        if (limitPriceMsg.chat.id !== chatId) return;
-        
-        const limitPrice = limitPriceMsg.text;
-        if (isNaN(limitPrice) || parseFloat(limitPrice) <= 0) {
-            await bot.sendMessage(chatId, "Invalid limit price. Please enter a valid number.");
-            return;
+    const priceHandler = createUserSpecificHandler(
+        bot,
+        chatId,
+        'message',
+        async (limitPriceMsg) => {
+            const limitPrice = limitPriceMsg.text;
+            if (isNaN(limitPrice) || parseFloat(limitPrice) <= 0) {
+                await bot.sendMessage(chatId, "Invalid limit price. Please enter a valid number.");
+                return;
+            }
+
+            tradeState.limitPrice = parseFloat(limitPrice);
+            tradeState.stage = 'sl_tp_selection';
+            await saveUserState(chatId, 'limit_trade', tradeState);
+
+            const slTpOptions = {
+                reply_markup: JSON.stringify({
+                    inline_keyboard: [
+                        [{ text: "Yes", callback_data: "set_sl_tp:yes" }],
+                        [{ text: "No", callback_data: "set_sl_tp:no" }],
+                    ],
+                }),
+            };
+
+            await bot.sendMessage(chatId, "Would you like to set Stop Loss and Take Profit?", slTpOptions);
+            await handleLimitSLTPSetup(bot, chatId, tradeState);
         }
+    );
 
-        tradeState.limitPrice = parseFloat(limitPrice);
-        tradeState.stage = 'sl_tp_selection';
-        await saveUserState(chatId, 'limit_trade', tradeState);
-
-        const slTpOptions = {
-            reply_markup: JSON.stringify({
-                inline_keyboard: [
-                    [{ text: "Yes", callback_data: "set_sl_tp:yes" }],
-                    [{ text: "No", callback_data: "set_sl_tp:no" }],
-                ],
-            }),
-        };
-
-        await bot.sendMessage(chatId, "Would you like to set Stop Loss and Take Profit?", slTpOptions);
-
-        await handleLimitSLTPSetup(bot, chatId, tradeState);
-    });
+    bot.on('message', priceHandler);
 }
 
 async function handleLimitSLTPSetup(bot, chatId, tradeState) {
-    bot.once("callback_query", async (slTpCallback) => {
-        if (slTpCallback.message.chat.id !== chatId) return;
-        
-        const [action, value] = slTpCallback.data.split(":");
-        
-        if (value === "yes") {
-            tradeState.stage = 'stop_loss_input';
-            await saveUserState(chatId, 'limit_trade', tradeState);
+    const slTpHandler = createUserSpecificHandler(
+        bot,
+        chatId,
+        'callback_query',
+        async (slTpCallback) => {
+            const [action, value] = slTpCallback.data.split(":");
             
-            await bot.sendMessage(
-                chatId,
-                `Enter Stop Loss price (or 'skip' to skip):\n`+
-                `Set Stoploss ${tradeState.buy ? `Below` : `Above`}, Your Limit Price ${
-                    tradeState.limitPrice > 1
-                    ? `${parseFloat(tradeState.limitPrice).toFixed(2)}`
-                    : `${parseFloat(tradeState.limitPrice).toFixed(2)}$`
-                }\n`
-            );
+            if (value === "yes") {
+                tradeState.stage = 'stop_loss_input';
+                await saveUserState(chatId, 'limit_trade', tradeState);
+                
+                await bot.sendMessage(
+                    chatId,
+                    `Enter Stop Loss price (or 'skip' to skip):\n` +
+                    `Set Stoploss ${tradeState.buy ? 'Below' : 'Above'}, Your Limit Price ${
+                        tradeState.limitPrice > 1
+                        ? parseFloat(tradeState.limitPrice).toFixed(2)
+                        : parseFloat(tradeState.limitPrice).toFixed(2)
+                    }$\n`
+                );
 
-            await handleLimitStopLossInput(bot, chatId, tradeState);
-        } else {
-            tradeState.stopLoss = 0;
-            tradeState.takeProfit = 0;
-            tradeState.stage = 'execution';
-            await saveUserState(chatId, 'limit_trade', tradeState);
-            
-            await bot.sendMessage(chatId, "Please check your wallet for trade confirmation...");
-            await proceedWithLimitTrade(
-                bot,
-                chatId,
-                tradeState.selectedPair,
-                tradeState.size,
-                tradeState.leverage,
-                tradeState.limitPrice,
-                tradeState.price,
-                tradeState.buy,
-                0,
-                0
-            );
+                await handleLimitStopLossInput(bot, chatId, tradeState);
+            } else {
+                tradeState.stopLoss = 0;
+                tradeState.takeProfit = 0;
+                tradeState.stage = 'execution';
+                await saveUserState(chatId, 'limit_trade', tradeState);
+                
+                await bot.sendMessage(chatId, "Please check your wallet for trade confirmation ");
+                await txQueue.addTransaction(chatId, async () => {
+                    await proceedWithLimitTrade(
+                        bot,
+                        chatId,
+                        tradeState.selectedPair,
+                        tradeState.size,
+                        tradeState.leverage,
+                        tradeState.limitPrice,
+                        tradeState.price,
+                        tradeState.buy,
+                        0,
+                        0
+                    );
+                });
+            }
         }
-    });
+    );
+
+    bot.on('callback_query', slTpHandler);
 }
 
 async function handleLimitStopLossInput(bot, chatId, tradeState) {
-    bot.once("message", async (slMsg) => {
-        if (slMsg.chat.id !== chatId) return;
-        
-        if (slMsg.text.toLowerCase() === 'skip') {
-            tradeState.stopLoss = 0;
-        } else {
-            const stopLoss = parseFloat(slMsg.text);
-            if (isNaN(stopLoss) || stopLoss <= 0) {
-                await bot.sendMessage(chatId, "Invalid Stop Loss. Please try again /openlimit");
-                return;
+    const slHandler = createUserSpecificHandler(
+        bot,
+        chatId,
+        'message',
+        async (slMsg) => {
+            if (slMsg.text.toLowerCase() === 'skip') {
+                tradeState.stopLoss = 0;
+            } else {
+                const stopLoss = parseFloat(slMsg.text);
+                if (isNaN(stopLoss) || stopLoss <= 0) {
+                    await bot.sendMessage(chatId, "Invalid Stop Loss. Please try again /openlimit");
+                    return;
+                }
+                tradeState.stopLoss = stopLoss;
             }
-            tradeState.stopLoss = stopLoss;
+
+            tradeState.stage = 'take_profit_input';
+            await saveUserState(chatId, 'limit_trade', tradeState);
+
+            await bot.sendMessage(
+                chatId,
+                `Enter Take Profit price (or 'skip' to skip):\n` +
+                `Set Take Profit ${tradeState.buy ? 'Above' : 'Below'} Limit Price ${
+                    tradeState.limitPrice > 1
+                    ? parseFloat(tradeState.limitPrice).toFixed(2)
+                    : parseFloat(tradeState.limitPrice).toFixed(2)
+                }$\n`
+            );
+
+            await handleLimitTakeProfitInput(bot, chatId, tradeState);
         }
+    );
 
-        tradeState.stage = 'take_profit_input';
-        await saveUserState(chatId, 'limit_trade', tradeState);
-
-        await bot.sendMessage(
-            chatId,
-            `Enter Take Profit price (or 'skip' to skip):\n`+
-            `Set Take Profit ${tradeState.buy ? `Above` : `Below`} Limit Price ${
-                tradeState.limitPrice > 1
-                ? `${parseFloat(tradeState.limitPrice).toFixed(2)}`
-                : `${parseFloat(tradeState.limitPrice).toFixed(2)}$`
-            }\n`
-        );
-
-        await handleLimitTakeProfitInput(bot, chatId, tradeState);
-    });
+    bot.on('message', slHandler);
 }
 
 async function handleLimitTakeProfitInput(bot, chatId, tradeState) {
-    bot.once("message", async (tpMsg) => {
-        if (tpMsg.chat.id !== chatId) return;
-        
-        if (tpMsg.text.toLowerCase() === 'skip') {
-            tradeState.takeProfit = 0;
-        } else {
-            const takeProfit = parseFloat(tpMsg.text);
-            if (isNaN(takeProfit) || takeProfit <= 0) {
-                await bot.sendMessage(chatId, "Invalid Take Profit. Please try again /openlimit");
-                return;
-            }
-            tradeState.takeProfit = takeProfit;
-        }
-
-        tradeState.stage = 'execution';
-        await saveUserState(chatId, 'limit_trade', tradeState);
-
-    })}  //neeed some changes 
-
-
-async function continueLimitTradeFlow(bot, chatId, tradeState, maxLeverage) {
-  await bot.sendMessage(chatId, 
-    `Size: ${tradeState.size} USDC. Now enter leverage:\nMax leverage for this pair is ${maxLeverage}x`
-  );
-
-  bot.once("message", async (leverageMsg) => {
-    const leverage = leverageMsg.text;
-    
-    if (isNaN(leverage) || parseFloat(leverage) <= 0 || parseFloat(leverage) > maxLeverage) {
-      await bot.sendMessage(leverageMsg.chat.id, `Invalid leverage. Please enter a valid number between 1 and ${maxLeverage}x`);
-      return;
-    }
-
-    tradeState.leverage = parseFloat(leverage);
-
-    let text;
-    if(tradeState.buy) {
-      text = `Below ${tradeState.price>1?parseFloat(tradeState.price).toFixed(2):parseFloat(tradeState.price).toFixed(4)} $.`;
-    } else {
-      text = `Above ${tradeState.price>1?parseFloat(tradeState.price).toFixed(2):parseFloat(tradeState.price).toFixed(4)} $.`;
-    }
-
-    await bot.sendMessage(leverageMsg.chat.id, 
-      `**Leverage: ${leverage}x**\n` +
-      `Present Trading price of selected pair: ${parseFloat(tradeState.price).toFixed(2)}$\n` +
-      `Enter the Limit Price ${text}`
-    );
-
-    bot.once("message", async (limitPriceMsg) => {
-      const limitPrice = limitPriceMsg.text;
-
-      if (isNaN(limitPrice) || parseFloat(limitPrice) <= 0) {
-        await bot.sendMessage(limitPriceMsg.chat.id, "Invalid limit price. Please enter a valid number.");
-        return;
-      }
-
-      tradeState.limitPrice = parseFloat(limitPrice);
-
-      const slTpOptions = {
-        reply_markup: JSON.stringify({
-          inline_keyboard: [
-            [{ text: "Yes", callback_data: "set_sl_tp:yes" }],
-            [{ text: "No", callback_data: "set_sl_tp:no" }],
-          ],
-        }),
-      };
-
-      await bot.sendMessage(limitPriceMsg.chat.id, "Would you like to set Stop Loss and Take Profit?", slTpOptions);
-
-      bot.once("callback_query", async (slTpCallback) => {
-        const [action, value] = slTpCallback.data.split(":");
-        
-        if (value === "yes") {
-          await bot.sendMessage(slTpCallback.message.chat.id, `Enter Stop Loss price (or 'skip' to skip):\n`+
-          `Set Stoploss ${tradeState.buy?`Below`:`Above`}, Your Limit Price ${tradeState.limitPrice>1?`${parseFloat(tradeState.limitPrice).toFixed(2)}`:`${parseFloat(tradeState.limitPrice).toFixed(2)}$`}\n`
-
-          );
-          
-          bot.once("message", async (slMsg) => {
-            if (slMsg.text.toLowerCase() === 'skip') {
-              tradeState.stopLoss = 0;
-            } else {
-              const stopLoss = parseFloat(slMsg.text);
-              if (isNaN(stopLoss) || stopLoss <= 0) {
-                await bot.sendMessage(slMsg.chat.id, "Invalid Stop Loss. Please try again /openlimit");
-                return;
-              }
-              tradeState.stopLoss = stopLoss;
-            }
-
-            await bot.sendMessage(slMsg.chat.id, `Enter Take Profit price (or 'skip' to skip):\n`+
-              `Set Take Profit ${tradeState.buy?`Above`:`Below`} Limit Price ${tradeState.limitPrice>1?`${parseFloat(tradeState.limitPrice).toFixed(2)}`:`${parseFloat(tradeState.limitPrice).toFixed(2)}$`}\n`
-
-            );
-            
-            bot.once("message", async (tpMsg) => {
-              if (tpMsg.text.toLowerCase() === 'skip') {
+    const tpHandler = createUserSpecificHandler(
+        bot,
+        chatId,
+        'message',
+        async (tpMsg) => {
+            if (tpMsg.text.toLowerCase() === 'skip') {
                 tradeState.takeProfit = 0;
-              } else {
+            } else {
                 const takeProfit = parseFloat(tpMsg.text);
                 if (isNaN(takeProfit) || takeProfit <= 0) {
-                  await bot.sendMessage(tpMsg.chat.id, "Invalid Take Profit. Please try again /openlimit");
-                  return;
+                    await bot.sendMessage(chatId, "Invalid Take Profit. Please try again /openlimit");
+                    return;
                 }
                 tradeState.takeProfit = takeProfit;
-              }
+            }
 
-              await bot.sendMessage(tpMsg.chat.id, "Please check your wallet for trade confirmation...");
-              await proceedWithLimitTrade(
-                bot,
-                tpMsg.chat.id,
-                tradeState.selectedPair,
-                tradeState.size,
-                tradeState.leverage,
-                tradeState.limitPrice,
-                tradeState.price,
-                tradeState.buy,
-                tradeState.stopLoss || 0,
-                tradeState.takeProfit || 0
-              );
+            tradeState.stage = 'execution';
+            await saveUserState(chatId, 'limit_trade', tradeState);
+
+            await bot.sendMessage(chatId, "Please check your wallet for trade confirmation...");
+            await txQueue.addTransaction(chatId, async () => {
+                await proceedWithLimitTrade(
+                    bot,
+                    chatId,
+                    tradeState.selectedPair,
+                    tradeState.size,
+                    tradeState.leverage,
+                    tradeState.limitPrice,
+                    tradeState.price,
+                    tradeState.buy,
+                    tradeState.stopLoss || 0,
+                    tradeState.takeProfit || 0
+                );
             });
-          });
-        } else {
-          tradeState.stopLoss = 0;
-          tradeState.takeProfit = 0;
-          await bot.sendMessage(slTpCallback.message.chat.id, "Please check your wallet for trade confirmation...");
-          await proceedWithLimitTrade(
-            bot,
-            slTpCallback.message.chat.id,
-            tradeState.selectedPair,
-            tradeState.size,
-            tradeState.leverage,
-            tradeState.limitPrice,
-            tradeState.price,
-            tradeState.buy,
-            0,
-            0
-          );
         }
-      });
-    });
-  });
+    );
+
+    bot.on('message', tpHandler);
 }
-// New function to handle limit trade execution with blockchain confirmation
+
 async function proceedWithLimitTrade(bot, chatId, selectedPair, size, leverage, limitPrice, currentPrice, buy, stopLoss, takeProfit) {
     try {
         const userSession = await getUserSession(chatId);
@@ -1329,7 +1424,7 @@ async function proceedWithLimitTrade(bot, chatId, selectedPair, size, leverage, 
 
         const initialMessage = await bot.sendMessage(
             chatId,
-            `Limit trade transaction submitted! Hash: ${result}\n`+
+            `Limit trade transaction submitted! Hash: ${result}\n` +
             `Waiting for blockchain confirmation...`
         );
 
@@ -1339,6 +1434,7 @@ async function proceedWithLimitTrade(bot, chatId, selectedPair, size, leverage, 
         console.error("Open limit trade error:", error.message);
         await bot.sendMessage(chatId, `Failed to open limit trade. Error: ${error.response?.data?.message || error.message}`);
         await clearUserState(chatId);
+        userTradeStates.delete(chatId);
     }
 }
 
@@ -1375,6 +1471,7 @@ async function monitorLimitTradeConfirmation(bot, chatId, txHash, messageId) {
                     
                     // Clear trade state after successful execution
                     await clearUserState(chatId);
+                    userTradeStates.delete(chatId);
                     return;
                 }
             }
@@ -1406,6 +1503,7 @@ async function monitorLimitTradeConfirmation(bot, chatId, txHash, messageId) {
 
     await checkConfirmations();
 }
+
 
 // Helper function to store trade in database with more details
 async function storeTrade(chatId, txHash, tradeDetails) {
@@ -1467,6 +1565,27 @@ async function getUserState(chatId) {
         );
     });
 }
+
+// User state management
+const userMarketStates = new Map();
+
+const txQueueMarket = new TransactionQueue();
+
+// Helper function to create user-specific event handlers
+function createUserSpecificHandler(bot, chatId, eventType, handler) {
+    const wrappedHandler = async (event) => {
+        if (event.chat?.id === chatId || event.message?.chat.id === chatId) {
+            try {
+                await handler(event);
+            } finally {
+                bot.removeListener(eventType, wrappedHandler);
+            }
+        }
+    };
+    return wrappedHandler;
+}
+
+// Main market trade handler
 async function handleMarketTrade(bot, msg) {
     const chatId = msg.chat.id;
     try {
@@ -1476,7 +1595,7 @@ async function handleMarketTrade(bot, msg) {
             return;
         }
 
-        // Initialize trade state for this user
+        // Initialize user-specific trade state
         const tradeState = {
             selectedPair: null,
             size: null,
@@ -1485,145 +1604,86 @@ async function handleMarketTrade(bot, msg) {
             price: null,
             stopLoss: null,
             takeProfit: null,
-            maxLeverage:null,
-            stage: 'pair_selection' // Track progress of trade setup
+            maxLeverage: null,
+            stage: 'pair_selection'
         };
 
-        // Save initial trade state
+        // Save initial state
         await saveUserState(chatId, 'market_trade', tradeState);
+        userMarketStates.set(chatId, tradeState);
 
         // Show pairs menu
-        await showPairsMenu(bot, chatId, "market");
+         showPairsMenu(bot, chatId, "market");
 
-        // Handle pair selection
-        bot.once("callback_query", async (callbackQuery) => {
-            if (callbackQuery.message.chat.id !== chatId) return;
-            
-            const { data, message } = callbackQuery;
-            const [action, type, selectedPair] = data.split(":");
+        // Create and attach pair selection handler
+        const pairSelectionHandler = createUserSpecificHandler(
+            bot,
+            chatId,
+            'callback_query',
+            async (callbackQuery) => {
+                const { data, message } = callbackQuery;
+                const [action, type, selectedPair] = data.split(":");
 
-            if (action !== "select_pair" || type !== "market") {
-                await bot.sendMessage(message.chat.id, "Invalid selection. Please try again.");
-                return;
-            }
+                if (action !== "select_pair" || type !== "market") {
+                    await bot.sendMessage(chatId, "Invalid selection. Please try again.");
+                    return;
+                }
 
-            try {
-                // Update trade state
-                tradeState.selectedPair = selectedPair;
-                tradeState.price = await price({ id: [feedIds[selectedPair].id] });
-                const maxLeverage = feedIds[selectedPair].leverage || "NaN";
-                tradeState.maxLeverage = maxLeverage;
-                tradeState.stage = 'direction_selection';
-                
-                await saveUserState(chatId, 'market_trade', tradeState);
-
-                // Show direction options
-                const options = {
-                    reply_markup: JSON.stringify({
-                        inline_keyboard: [
-                            [{ text: "Long 🟢", callback_data: `trade_direction:long:${selectedPair}` }],
-                            [{ text: "Short 🔴", callback_data: `trade_direction:short:${selectedPair}` }],
-                        ],
-                    }),
-                };
-
-                await bot.sendMessage(message.chat.id, "Do you want to go Long🟢 or Short🔴?", options);
-
-                // Handle direction selection
-                // bot.once("callback_query", async (directionCallback) => {
-                //     if (directionCallback.message.chat.id !== chatId) return;
+                try {
+                    // Update trade state with selected pair
+                    const currentState = userMarketStates.get(chatId);
+                    currentState.selectedPair = selectedPair;
+                    currentState.price = await price({ id: [feedIds[selectedPair].id] });
+                    const maxLeverage = feedIds[selectedPair].leverage || "NaN";
+                    currentState.maxLeverage = maxLeverage;
+                    currentState.stage = 'direction_selection';
                     
-                //     const directionData = directionCallback.data.split(":");
-                //     const direction = directionData[1];
-                //     tradeState.buy = direction === "long";
-                //     tradeState.stage = 'size_input';
-                    
-                //     await saveUserState(chatId, 'market_trade', tradeState);
-                //     await bot.sendMessage(
-                //         directionCallback.message.chat.id, 
-                //         `You selected ${tradeState.buy ? "Long 🟢" : "Short 🔴"}. Enter the size in USDC:`
-                //     );
+                    await saveUserState(chatId, 'market_trade', currentState);
 
-                //     // Handle size input
-                //     bot.once("message", async (sizeMsg) => {
-                //         if (sizeMsg.chat.id !== chatId) return;
-                        
-                //         const size = sizeMsg.text;
-                //         if (isNaN(size) || parseFloat(size) <= 0) {
-                //             await bot.sendMessage(sizeMsg.chat.id, "Invalid size. Please enter a valid number.");
-                //             return;
-                //         }
+                    // Show direction options
+                    const options = {
+                        reply_markup: JSON.stringify({
+                            inline_keyboard: [
+                                [{ text: "Long 🟢", callback_data: `trade_direction:long:${selectedPair}` }],
+                                [{ text: "Short 🔴", callback_data: `trade_direction:short:${selectedPair}` }],
+                            ],
+                        }),
+                    };
 
-                //         try {
-                //             // Check balance and allowance
-                //             const check_balance = await CONTRACT_INSTANCE_USDC.balanceOf(userSession.address);
-                //             const check_allowance = await CONTRACT_INSTANCE_USDC.allowance(
-                //                 userSession.address, 
-                //                 SPENDER_APPROVE
-                //             );
-                //             const requiredAmount = ethers.parseUnits(size.toString(), 6);
+                    await bot.sendMessage(chatId, "Do you want to go Long🟢 or Short🔴?", options);
+
+                    // Create and attach direction selection handler
+                    const directionHandler = createUserSpecificHandler(
+                        bot,
+                        chatId,
+                        'callback_query',
+                        async (directionCallback) => {
+                            const directionData = directionCallback.data.split(":");
+                            const direction = directionData[1];
+                            currentState.buy = direction === "long";
+                            currentState.stage = 'size_input';
                             
-                //             tradeState.size = parseFloat(size);
-                //             tradeState.stage = 'approval_check';
-                //             await saveUserState(chatId, 'market_trade', tradeState);
+                            await saveUserState(chatId, 'market_trade', currentState);
+                            await handleMarketTradeSize(bot, chatId, currentState);
+                        }
+                    );
 
-                //             if (check_balance < requiredAmount) {
-                //                 await bot.sendMessage(sizeMsg.chat.id, 
-                //                     `Insufficient balance!\n` +
-                //                     `Available Balance: ${ethers.formatUnits(check_balance, 6)} USDC\n` +
-                //                     `Required Amount: ${size} USDC`
-                //                 );
-                //                 return;
-                //             }
+                    bot.on('callback_query', directionHandler);
 
-                //             // Handle insufficient allowance
-                //             if (check_allowance < requiredAmount) {
-                //                 await handleInsufficientAllowance(
-                //                     bot, 
-                //                     sizeMsg, 
-                //                     check_allowance, 
-                //                     size, 
-                //                     tradeState
-                //                 );
-                //             } else {
-                //                 await handleLeverageInput(
-                //                     bot, 
-                //                     sizeMsg.chat.id, 
-                //                     size, 
-                //                     maxLeverage, 
-                //                     tradeState
-                //                 );
-                //             }
-
-                //         } catch (error) {
-                //             console.error("Trade processing error:", error);
-                //             await bot.sendMessage(sizeMsg.chat.id, "Error processing trade. Please try again.");
-                //         }
-                //     });
-                // });
-
-                  // Handle direction selection
-                  bot.once("callback_query", async (directionCallback) => {
-                    if (directionCallback.message.chat.id !== chatId) return;
-                    
-                    const directionData = directionCallback.data.split(":");
-                    const direction = directionData[1];
-                    tradeState.buy = direction === "long";
-                    tradeState.stage = 'size_input';
-                    
-                    await saveUserState(chatId, 'market_trade', tradeState);
-                    await handleMarketTradeSize(bot, chatId, tradeState);
-                });
-                
-            } catch (error) {
-                console.error("Error in pair selection:", error);
-                await bot.sendMessage(message.chat.id, "Error processing selection. Please try again.");
+                } catch (error) {
+                    console.error("Error in pair selection:", error);
+                    await bot.sendMessage(chatId, "Error processing selection. Please try again.");
+                }
             }
-        });
+        );
+
+        bot.on('callback_query', pairSelectionHandler);
 
     } catch (error) {
         console.error("Handle market trade error:", error);
-        await bot.sendMessage(chatId, "Failed to open Market trade. Please try again.");
+        await bot.sendMessage(chatId, "Failed to open market trade. Please try again.");
+        await clearUserState(chatId);
+        userMarketStates.delete(chatId);
     }
 }
 
@@ -1633,55 +1693,61 @@ async function handleMarketTradeSize(bot, chatId, tradeState) {
         `You selected ${tradeState.buy ? "Long 🟢" : "Short 🔴"}. Enter the size in USDC:`
     );
 
-    bot.once("message", async (sizeMsg) => {
-        if (sizeMsg.chat.id !== chatId) return;
-        
-        const size = sizeMsg.text;
-        if (isNaN(size) || parseFloat(size) <= 0) {
-            await bot.sendMessage(chatId, "Invalid size. Please enter a valid number.");
-            return;
-        }
-
-        try {
-            const userSession = await getUserSession(chatId);
-            const check_balance = await CONTRACT_INSTANCE_USDC.balanceOf(userSession.address);
-            const check_allowance = await CONTRACT_INSTANCE_USDC.allowance(
-                userSession.address, 
-                SPENDER_APPROVE
-            );
-            const requiredAmount = ethers.parseUnits(size.toString(), 6);
-            
-            tradeState.size = parseFloat(size);
-            tradeState.stage = 'approval_check';
-            await saveUserState(chatId, 'market_trade', tradeState);
-
-            if (check_balance < requiredAmount) {
-                await bot.sendMessage(chatId, 
-                    `Insufficient balance!\n` +
-                    `Available Balance: ${ethers.formatUnits(check_balance, 6)} USDC\n` +
-                    `Required Amount: ${size} USDC`
-                );
+    const sizeHandler = createUserSpecificHandler(
+        bot,
+        chatId,
+        'message',
+        async (sizeMsg) => {
+            const size = sizeMsg.text;
+            if (isNaN(size) || parseFloat(size) <= 0) {
+                await bot.sendMessage(chatId, "Invalid size. Please enter a valid number.");
                 return;
             }
 
-            if (check_allowance < requiredAmount) {
-                await handleInsufficientAllowance(
-                    bot,
-                    sizeMsg,
-                    check_allowance,
-                    size,
-                    tradeState
+            try {
+                const userSession = await getUserSession(chatId);
+                const check_balance = await CONTRACT_INSTANCE_USDC.balanceOf(userSession.address);
+                const check_allowance = await CONTRACT_INSTANCE_USDC.allowance(
+                    userSession.address, 
+                    SPENDER_APPROVE
                 );
-            } else {
-                await handleLeverageInput(bot, chatId,size,tradeState?.maxLeverage, tradeState);
-            }
+                const requiredAmount = ethers.parseUnits(size.toString(), 6);
+                
+                tradeState.size = parseFloat(size);
+                tradeState.stage = 'approval_check';
+                await saveUserState(chatId, 'market_trade', tradeState);
 
-        } catch (error) {
-            console.error("Trade processing error:", error);
-            await bot.sendMessage(chatId, "Error processing trade. Please try again.");
+                if (check_balance < requiredAmount) {
+                    await bot.sendMessage(chatId, 
+                        `Insufficient balance!\n` +
+                        `Available Balance: ${ethers.formatUnits(check_balance, 6)} USDC\n` +
+                        `Required Amount: ${size} USDC`
+                    );
+                    return;
+                }
+
+                if (check_allowance < requiredAmount) {
+                    await handleInsufficientAllowance(
+                        bot,
+                        sizeMsg,
+                        check_allowance,
+                        size,
+                        tradeState
+                    );
+                } else {
+                    await handleLeverageInput(bot, chatId, size, tradeState.maxLeverage, tradeState);
+                }
+
+            } catch (error) {
+                console.error("Trade processing error:", error);
+                await bot.sendMessage(chatId, "Error processing trade. Please try again.");
+            }
         }
-    });
+    );
+
+    bot.on('message', sizeHandler);
 }
+
 async function handleInsufficientAllowance(bot, sizeMsg, check_allowance, size, tradeState) {
     const chatId = sizeMsg.chat.id;
     const neededApproval = ethers.formatUnits(
@@ -1706,62 +1772,69 @@ async function handleInsufficientAllowance(bot, sizeMsg, check_allowance, size, 
         approveOptions
     );
 
-    // Handle approve callback
-    bot.once("callback_query", async (approveCallback) => {
-        if (approveCallback.message.chat.id !== chatId) return;
-        
-        const [action, value] = approveCallback.data.split(":");
-        
-        if (action === "approve" && value !== "cancel") {
-            const approveMsg = {
-                chat: { id: chatId },
-                text: `/approve ${value}`
-            };
-
-            const approvalSuccess = await handleApprove(bot, approveMsg, tradeState);
+    const approveHandler = createUserSpecificHandler(
+        bot,
+        chatId,
+        'callback_query',
+        async (approveCallback) => {
+            const [action, value] = approveCallback.data.split(":");
             
-            if (!approvalSuccess) {
-                await bot.sendMessage(chatId, "Approval failed or was rejected. Please try again /openmarket");
-                return;
+            if (action === "approve" && value !== "cancel") {
+                const approveMsg = {
+                    chat: { id: chatId },
+                    text: `/approve ${value}`
+                };
+
+                const approvalSuccess = await handleApprove(bot, approveMsg, tradeState);
+                
+                if (!approvalSuccess) {
+                    await bot.sendMessage(chatId, "Approval failed or was rejected. Please try again /openmarket");
+                    return;
+                }
+
+                await handleLeverageInput(bot, chatId, size, tradeState.maxLeverage, tradeState);
+            } else {
+                await bot.sendMessage(chatId, "Trade cancelled. Use /openmarket to start again.");
+                await clearUserState(chatId);
+                userMarketStates.delete(chatId);
             }
-           await handleLeverageInput(bot, chatId, tradeState)
-        } else {
-            await bot.sendMessage(chatId, "Trade cancelled. Use /openmarket to start again.");
         }
-    });
+    );
+
+    bot.on('callback_query', approveHandler);
 }
 
-// Helper function to handle leverage input
 async function handleLeverageInput(bot, chatId, size, maxLeverage, tradeState) {
-    console.log(chatId, size, maxLeverage, tradeState)
     await bot.sendMessage(chatId, 
         `Size: ${size} USDC. Now enter leverage:\nMax leverage for this pair is ${maxLeverage}x`
     );
-    
-    tradeState.stage ='leverage_input';
+
+    tradeState.stage = 'leverage_input';
     await saveUserState(chatId, 'market_trade', tradeState);
 
-    // Handle leverage input message
-    bot.once("message", async (leverageMsg) => {
-        if (leverageMsg.chat.id !== chatId) return;
-        
-        const leverage = leverageMsg.text;
-        
-        if (isNaN(leverage) || parseFloat(leverage) <= 0 || parseFloat(leverage) > maxLeverage) {
-            await bot.sendMessage(chatId, 
-                `Invalid leverage. Please enter a valid number between 1 and ${maxLeverage}x`
-            );
-            return;
+    const leverageHandler = createUserSpecificHandler(
+        bot,
+        chatId,
+        'message',
+        async (leverageMsg) => {
+            const leverage = leverageMsg.text;
+            
+            if (isNaN(leverage) || parseFloat(leverage) <= 0 || parseFloat(leverage) > maxLeverage) {
+                await bot.sendMessage(chatId, 
+                    `Invalid leverage. Please enter a valid number between 1 and ${maxLeverage}x`
+                );
+                return;
+            }
+
+            tradeState.leverage = parseFloat(leverage);
+            tradeState.stage = 'sl_tp_selection';
+            await saveUserState(chatId, 'market_trade', tradeState);
+
+            await handleSLTPSetup(bot, chatId, tradeState);
         }
+    );
 
-        tradeState.leverage = parseFloat(leverage);
-        tradeState.stage = 'sl_tp_selection';
-        await saveUserState(chatId, 'market_trade', tradeState);
-
-  
-
-    await handleSLTPSetup(bot, chatId, tradeState);
-    });
+    bot.on('message', leverageHandler);
 }
 
 async function handleSLTPSetup(bot, chatId, tradeState) {
@@ -1776,118 +1849,131 @@ async function handleSLTPSetup(bot, chatId, tradeState) {
 
     await bot.sendMessage(chatId, "Would you like to set Stop Loss and Take Profit?", slTpOptions);
 
-    bot.once("callback_query", async (slTpCallback) => {
-        if (slTpCallback.message.chat.id !== chatId) return;
-        
-        const [action, value] = slTpCallback.data.split(":");
-        
-        if (value === "yes") {
-            tradeState.stage = 'stop_loss_input';
-            await saveUserState(chatId, 'market_trade', tradeState);
+    const slTpHandler = createUserSpecificHandler(
+        bot,
+        chatId,
+        'callback_query',
+        async (slTpCallback) => {
+            const [action, value] = slTpCallback.data.split(":");
             
-            await bot.sendMessage(
-                chatId,
-                `Enter Stop Loss price (or 'skip' to skip):\n`+
-                `Set Stoploss ${tradeState.buy ? `Below` : `Above`} Market Price ${
-                    tradeState.price > 1 
-                    ? `${parseFloat(tradeState.price).toFixed(2)}` 
-                    : `${parseFloat(tradeState.price).toFixed(4)}$`
-                }\n`
-            );
+            if (value === "yes") {
+                tradeState.stage = 'stop_loss_input';
+                await saveUserState(chatId, 'market_trade', tradeState);
+                
+                await bot.sendMessage(
+                    chatId,
+                    `Enter Stop Loss price (or 'skip' to skip):\n` +
+                    `Set Stoploss ${tradeState.buy ? 'Below' : 'Above'} Market Price ${
+                        tradeState.price > 1
+                        ? parseFloat(tradeState.price).toFixed(2)
+                        : parseFloat(tradeState.price).toFixed(4)
+                    }$\n`
+                );
 
-            // Handle stop loss input
-            await handleStopLossInput(bot, chatId, tradeState);
-        } else {
-            tradeState.stopLoss = 0;
-            tradeState.takeProfit = 0;
-            tradeState.stage = 'execution';
-            await saveUserState(chatId, 'market_trade', tradeState);
-            
-            await bot.sendMessage(chatId, "Please check your wallet for trade confirmation...");
-            await proceedWithTrade(
-                bot,
-                chatId,
-                tradeState.selectedPair,
-                tradeState.size,
-                tradeState.leverage,
-                tradeState.price,
-                tradeState.buy,
-                0,
-                0
-            );
+                await handleStopLossInput(bot, chatId, tradeState);
+            } else {
+                tradeState.stopLoss = 0;
+                tradeState.takeProfit = 0;
+                tradeState.stage = 'execution';
+                await saveUserState(chatId, 'market_trade', tradeState);
+                
+                await bot.sendMessage(chatId, "Please check your wallet for trade confirmation...");
+                await txQueueMarket.addTransaction(chatId, async () => {
+                    await proceedWithTrade(
+                        bot,
+                        chatId,
+                        tradeState.selectedPair,
+                        tradeState.size,
+                        tradeState.leverage,
+                        tradeState.price,
+                        tradeState.buy,
+                        0,
+                        0
+                    );
+                });
+            }
         }
-    });
+    );
+
+    bot.on('callback_query', slTpHandler);
 }
 
 async function handleStopLossInput(bot, chatId, tradeState) {
-    bot.once("message", async (slMsg) => {
-        if (slMsg.chat.id !== chatId) return;
-        
-        if (slMsg.text.toLowerCase() === 'skip') {
-            tradeState.stopLoss = 0;
-        } else {
-            const stopLoss = parseFloat(slMsg.text);
-            if (isNaN(stopLoss) || stopLoss <= 0) {
-                await bot.sendMessage(chatId, "Invalid Stop Loss. Please try again /openmarket");
-                return;
+    const slHandler = createUserSpecificHandler(
+        bot,
+        chatId,
+        'message',
+        async (slMsg) => {
+            if (slMsg.text.toLowerCase() === 'skip') {
+                tradeState.stopLoss = 0;
+            } else {
+                const stopLoss = parseFloat(slMsg.text);
+                if (isNaN(stopLoss) || stopLoss <= 0) {
+                    await bot.sendMessage(chatId, "Invalid Stop Loss. Please try again /openmarket");
+                    return;
+                }
+                tradeState.stopLoss = stopLoss;
             }
-            tradeState.stopLoss = stopLoss;
+
+            tradeState.stage = 'take_profit_input';
+            await saveUserState(chatId, 'market_trade', tradeState);
+
+            await bot.sendMessage(
+                chatId,
+                `Enter Take Profit price (or 'skip' to skip):\n` +
+                `Set Take Profit ${tradeState.buy ? 'Above' : 'Below'} Market Price ${
+                    tradeState.price > 1
+                    ? parseFloat(tradeState.price).toFixed(2)
+                    : parseFloat(tradeState.price).toFixed(4)
+                }$\n`
+            );
+
+            await handleTakeProfitInput(bot, chatId, tradeState);
         }
+    );
 
-        tradeState.stage = 'take_profit_input';
-        await saveUserState(chatId, 'market_trade', tradeState);
-
-        await bot.sendMessage(
-            chatId,
-            `Enter Take Profit price (or 'skip' to skip):\n`+
-            `Set Take Profit ${tradeState.buy ? `Above` : `Below`} Market Price ${
-                tradeState.price > 1
-                ? `${parseFloat(tradeState.price).toFixed(2)}`
-                : `${parseFloat(tradeState.price).toFixed(4)}$`
-            }\n`
-        );
-
-        await handleTakeProfitInput(bot, chatId, tradeState);
-    });
+    bot.on('message', slHandler);
 }
 
 async function handleTakeProfitInput(bot, chatId, tradeState) {
-    bot.once("message", async (tpMsg) => {
-        if (tpMsg.chat.id !== chatId) return;
-        
-        if (tpMsg.text.toLowerCase() === 'skip') {
-            tradeState.takeProfit = 0;
-        } else {
-            const takeProfit = parseFloat(tpMsg.text);
-            if (isNaN(takeProfit) || takeProfit <= 0) {
-                await bot.sendMessage(chatId, "Invalid Take Profit. Please try again /openmarket");
-                return;
+    const tpHandler = createUserSpecificHandler(
+        bot,
+        chatId,
+        'message',
+        async (tpMsg) => {
+            if (tpMsg.text.toLowerCase() === 'skip') {
+                tradeState.takeProfit = 0;
+            } else {
+                const takeProfit = parseFloat(tpMsg.text);
+                if (isNaN(takeProfit) || takeProfit <= 0) {
+                    await bot.sendMessage(chatId, "Invalid Take Profit. Please try again /openmarket");
+                    return;
+                }
+                tradeState.takeProfit = takeProfit;
             }
-            tradeState.takeProfit = takeProfit;
+
+            tradeState.stage = 'execution';
+            await saveUserState(chatId, 'market_trade', tradeState);
+
+            await bot.sendMessage(chatId, "Please check your wallet for trade confirmation...");
+            await txQueue.addTransaction(chatId, async () => {
+                await proceedWithTrade(
+                    bot,
+                    chatId,
+                    tradeState.selectedPair,
+                    tradeState.size,
+                    tradeState.leverage,
+                    tradeState.price,
+                    tradeState.buy,
+                    tradeState.stopLoss || 0,
+                    tradeState.takeProfit || 0
+                );
+            });
         }
+    );
 
-        tradeState.stage = 'execution';
-        await saveUserState(chatId, 'market_trade', tradeState);
-
-        await bot.sendMessage(tpMsg.chat.id, "Please check your wallet for trade confirmation...");
-        await proceedWithTrade(
-            bot,
-            chatId,
-            tradeState.selectedPair,
-            tradeState.size,
-            tradeState.leverage,
-            tradeState.price,
-            tradeState.buy,
-            tradeState.stopLoss || 0,
-            tradeState.takeProfit || 0
-        );
-    });
+    bot.on('message', tpHandler);
 }
-
-
-
-//New function to handle trade execution with blockchain confirmation
-
 
 async function proceedWithTrade(bot, chatId, selectedPair, size, leverage, Price, buy, stopLoss, takeProfit) {
     try {
@@ -1958,7 +2044,7 @@ async function proceedWithTrade(bot, chatId, selectedPair, size, leverage, Price
 
         const initialMessage = await bot.sendMessage(
             chatId,
-            `Market trade transaction submitted! Hash: ${result}\n`+
+            `Market trade transaction submitted! Hash: ${result}\n` +
             `Waiting for blockchain confirmation...`
         );
 
@@ -1967,22 +2053,30 @@ async function proceedWithTrade(bot, chatId, selectedPair, size, leverage, Price
     } catch (error) {
         console.error("Open trade error:", error.message);
         await bot.sendMessage(chatId, `Failed to open trade. Error: ${error.response?.data?.message || error.message}`);
-        
-        // Clean up trade state
-        const userState = await getUserState(chatId);
-        if (userState && userState.type === 'market_trade') {
-            await clearUserState(chatId);
-        }
+        await clearUserState(chatId);
+        userMarketStates.delete(chatId);
     }
 }
 
-
-async function monitorTradeConfirmation(bot, chatId, txHash, messageId) {
+// Modified monitoring function for trades
+async function monitorTradeConfirmation(bot, chatId, txHash, messageId, type = 'market') {
     const startTime = Date.now();
     const maxWaitTime = 2 * 60 * 1000; // 2 minutes timeout
 
     const checkConfirmations = async () => {
         try {
+            // Check if request is still valid
+            if (!isValidRequest(txHash, chatId)) {
+                await bot.editMessageText(
+                    `Trade request expired or invalid. Please try again with /open${type}.`,
+                    {
+                        chat_id: chatId,
+                        message_id: messageId
+                    }
+                );
+                return;
+            }
+
             const receipt = await Provider.getTransactionReceipt(txHash);
             
             if (receipt) {
@@ -1990,8 +2084,17 @@ async function monitorTradeConfirmation(bot, chatId, txHash, messageId) {
                 const confirmations = currentBlock - receipt.blockNumber;
 
                 if (confirmations >= 3) {
+                    // Store trade in database and update request status
+                    await storeTrade(chatId, txHash, {
+                        type: type,
+                        status: 'pending',
+                        timestamp: Date.now()
+                    });
+
+                    updateRequestStatus(txHash, 'confirmed');
+
                     await bot.editMessageText(
-                        `Market Order Confirmed! ✅\n` +
+                        `${type.charAt(0).toUpperCase() + type.slice(1)} Order Confirmed! ✅\n` +
                         `Transaction Hash: ${txHash}\n` +
                         `Confirmations: ${confirmations}\n` +
                         `Check your trades using /opentrades.`,
@@ -2001,8 +2104,8 @@ async function monitorTradeConfirmation(bot, chatId, txHash, messageId) {
                         }
                     );
                     
-                    // Clear trade state after successful execution
-                    await clearUserState(chatId);
+                    // Cleanup after confirmation
+                    activeRequests.delete(txHash);
                     return;
                 }
             }
@@ -2010,8 +2113,10 @@ async function monitorTradeConfirmation(bot, chatId, txHash, messageId) {
             if (Date.now() - startTime < maxWaitTime) {
                 setTimeout(() => checkConfirmations(), 5000);
             } else {
+                updateRequestStatus(txHash, 'timeout');
                 await bot.editMessageText(
-                    `Market Order transaction timed out. Please check /opentrades to verify status.\n` +
+                    `${type.charAt(0).toUpperCase() + type.slice(1)} Order transaction timed out.\n` +
+                    `Please check /opentrades to verify status.\n` +
                     `Transaction Hash: ${txHash}`,
                     {
                         chat_id: chatId,
@@ -2021,8 +2126,10 @@ async function monitorTradeConfirmation(bot, chatId, txHash, messageId) {
             }
         } catch (error) {
             console.error("Trade confirmation check error:", error);
+            updateRequestStatus(txHash, 'error');
             await bot.editMessageText(
-                `Error checking Market Order status. Please check /opentrades to verify status.\n` +
+                `Error checking ${type} order status.\n` +
+                `Please check /opentrades to verify status.\n` +
                 `Transaction Hash: ${txHash}`,
                 {
                     chat_id: chatId,
@@ -2034,6 +2141,8 @@ async function monitorTradeConfirmation(bot, chatId, txHash, messageId) {
 
     await checkConfirmations();
 }
+
+
 
 async function startPriceMonitoring(chatId, tradeData) {
     // Stop existing monitor if any
@@ -2169,7 +2278,7 @@ async function price(params) {
 async function handleGetTrades(bot, msg) {
     const chatId = msg?.chat?.id;
     try {
-        await bot.sendMessage(chatId, "Fetching Open Market/Limit trades, wait for response..");
+        await bot.sendMessage(chatId, "**Fetching Open trades 🔃**");
 
         const userSession = await getUserSession(chatId);
         if (!userSession || !userSession.address) {
@@ -2354,7 +2463,7 @@ async function sendTradeMessage(bot, chatId, message, trade, type) {
 async function upsertTradeInDatabase(chatId, trade, isLimit = false) {
     const tradeData = {
         pairIndex: trade.pairIndex.toString(),
-        index: trade.index,
+        index: trade.index.toString(),
         size: isLimit 
             ? ethers.formatUnits(trade.positionSize, 6)
             : ethers.formatUnits(trade.initialPosToken, 6),
@@ -2362,6 +2471,8 @@ async function upsertTradeInDatabase(chatId, trade, isLimit = false) {
         status: isLimit ? 'pending' : 'active',
         timestamp: Date.now()
     };
+
+    console.log(tradeData)
 
     return new Promise((resolve, reject) => {
         db.run(`
