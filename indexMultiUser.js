@@ -66,6 +66,7 @@ async function initDatabase() {
                     tx_hash TEXT,
                     trade_status TEXT DEFAULT 'pending',
                     trade_type TEXT,
+                    trade_data TEXT,
                     last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (chat_id, order_id)
                 )
@@ -295,7 +296,7 @@ async function initBot() {
         await handleApprove(bot, approveMsg);
       } catch (error) {
         console.error("Error during approval:", error);
-        await bot.sendMessage(chatId, "❌ Failed to process approval. Please try again.");
+        await bot.sendMessage(chatId, "❌ Failed to process approval. Please try again. /approve");
       }
     });
 
@@ -1181,7 +1182,7 @@ async function handleLimitLeverageInput(bot, chatId, tradeState) {
 
             await bot.sendMessage(
                 chatId, 
-                `**Leverage: ${leverage}x**\n` +
+                `Leverage: ${leverage}x\n` +
                 `Present Trading price of selected pair: ${parseFloat(tradeState.price).toFixed(2)}$\n` +
                 `Enter the Limit Price ${text}`
             );
@@ -2278,7 +2279,7 @@ async function price(params) {
 async function handleGetTrades(bot, msg) {
     const chatId = msg?.chat?.id;
     try {
-        await bot.sendMessage(chatId, "**Fetching Open trades 🔃**");
+        await bot.sendMessage(chatId, "Fetching Open trades 🔃");
 
         const userSession = await getUserSession(chatId);
         if (!userSession || !userSession.address) {
@@ -2417,7 +2418,7 @@ function formatTradeMessage(trade, pairName, openPrice, currentPrice, profitStat
 // Format limit order message
 function formatLimitOrderMessage(order, pairName) {
     return `
-    **Pending Limit Order:**
+    📣Pending Limit Order:
     - Pair: ${pairName}
     - Position Size: ${ethers.formatUnits(order.positionSize, 6)}
     - Leverage: ${ethers.formatUnits(order.leverage, 10)}x
@@ -2660,13 +2661,13 @@ async function handleTradeCloseCallback_limit(bot, query, contractInstance) {
         console.error("Handle limit trade cancellation error:", error);
         try {
             await bot.answerCallbackQuery(query.id, { 
-                text: "Failed to cancel limit order. Please try again later.",
+                text: "Failed to cancel limit order. Check /opentrades again.",
                 show_alert: true 
             });
         } catch (cbError) {
             console.error("Error answering callback query:", cbError);
         }
-        await bot.sendMessage(chatId, "❌ Failed to cancel limit order. Please try again later.");
+        await bot.sendMessage(chatId, "❌ Failed to cancel limit order. Check /opentrades again.");
         await clearUserState(chatId);
     }
 }

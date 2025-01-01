@@ -41,8 +41,8 @@ class UserSignClient {
                 this.signClient = await SignClient.init({
                     projectId: process.env.PROJECT_ID,
                     metadata: {
-                        name: 'Trading Bot',
-                        description: 'Trading Bot for Base Chain',
+                        name: 'Avantis Trading Bot',
+                        description: 'Avantis Levearage Platform Trading Bot On Base Chain',
                         url: 'https://walletconnect.com',
                         icons: ['https://avatars.githubusercontent.com/u/37784886']
                     }
